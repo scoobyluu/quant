@@ -1,61 +1,65 @@
 # Quant
 
-Market data is represented and processed with Polars, then cached locally as
-Parquet for analysis and repeatable testing. Ships two entry points:
-
-- `quant` — CLI that prints the latest price and volume for every S&P 500 constituent.
-- `quant-dashboard` — FastAPI + vanilla-JS SPA with a watchlist, holdings, and per-stock detail (price history, fundamentals, analyst ratings, earnings, options, news).
-
-## Prerequisites
-
-- **Python 3.14+** — the version is pinned in `.python-version`.
-- **[uv](https://docs.astral.sh/uv/)** — used for dependency and environment management. Install with:
-
-  ```sh
-  # macOS / Linux
-  curl -LsSf https://astral.sh/uv/install.sh | sh
-
-  # or via Homebrew
-  brew install uv
-  ```
-
-  `uv` will fetch the correct Python version automatically on first run.
+Quant is a cache-first portfolio and market-analysis project built with Polars.
+It provides a terminal CLI and a FastAPI dashboard backed by shared analysis and
+market-data services.
 
 ## Install
 
-Clone the repo, then from the project root:
+Python 3.14 is pinned in `.python-version`. Install dependencies with:
 
 ```sh
 uv sync
 ```
 
-This creates a `.venv/` and installs all dependencies from `uv.lock`.
+## CLI
 
-## Run the CLI
-
-Use the local cache, downloading the latest five trading sessions if it does not
-exist:
+Print the latest cached S&P 500 constituent quotes:
 
 ```sh
-uv run quant
+uv run quant index
 ```
 
-Refresh the cache from Yahoo Finance:
+Refresh the index cache from Yahoo Finance:
 
 ```sh
-uv run quant --refresh
+uv run quant index --refresh
 ```
 
-The default cache is `data/sp500_market_data.parquet`. Each row contains a
-trading date, symbol, company, closing price, and volume.
+Analyze `portfolio.csv` using cached prices first:
 
-## Run the dashboard
+```sh
+uv run quant portfolio
+```
+
+Analyze selected symbols with explicit trading-session windows and price basis:
+
+```sh
+uv run quant market AAPL MSFT --windows 5 20 --price adjusted
+```
+
+Analyze the full cached S&P 500:
+
+```sh
+uv run quant market --index --windows 5 20 --price adjusted
+```
+
+Market analysis calculates daily price changes, moving averages, rolling
+highs/lows, volume averages, and relative volume.
+
+The portfolio CSV requires `ticker`, `quantity`, and `cost`, where `cost` is the
+average cost per share. Optional `account`, `asset_class`, `sector`, and
+`acquired` columns are accepted during import.
+
+## Dashboard
+
+Run the FastAPI dashboard:
 
 ```sh
 uv run quant-dashboard
 ```
 
-Open http://127.0.0.1:8001. Override the bind address with env vars:
+Open http://127.0.0.1:8001. Override the bind address when needed:
 
 ```sh
 HOST=0.0.0.0 PORT=9000 uv run quant-dashboard
@@ -63,49 +67,30 @@ HOST=0.0.0.0 PORT=9000 uv run quant-dashboard
 
 Routes:
 
-- `/` — UI (watchlist at `#/`, holdings at `#/holdings`, stock detail at `#/stock/AAPL`)
-- `/api/*` — JSON API
-- `/docs` — auto-generated Swagger docs
+- `/` serves the dashboard.
+- `/api/*` provides JSON APIs.
+- `/docs` provides generated API documentation.
 
-### Holdings seeding
+The dashboard includes a watchlist, holdings, stock history, fundamentals,
+analyst ratings, earnings, options, and news.
 
-On first run, `src/quant/dashboard/data/holdings.json` is auto-populated from `portfolio.csv` at the repo root. The CSV format is:
+On first use, `portfolio.csv` is imported into `data/quant.db`. The dashboard
+then treats SQLite as the source of truth for position lots and watchlists; the
+CSV remains an import/export format.
 
-```csv
-ticker,quantity,cost
-AAPL,23,327.82
-```
+## Storage
 
-Edit `portfolio.csv` before the first launch, or manage holdings through the UI afterwards.
+- `data/sp500_market_data.parquet` stores cached index bars.
+- `data/portfolio_market_data.parquet` stores supplemental portfolio quotes.
+- `data/market_analysis.parquet` stores full bars used by market analysis.
+- `data/quant.db` stores app-managed position lots and watchlists.
+- `portfolio.csv` is the import format for portfolio positions.
 
 ## Tests
 
 ```sh
-uv run python -m pytest
+PYTHONDONTWRITEBYTECODE=1 uv run python -m unittest discover -s tests
 ```
 
-## Notes
-
-- `yfinance` is unofficial and rate-limited; expect occasional 5xx responses from Yahoo.
-- The dashboard keeps a 30s in-memory cache and serves stale data for up to 1h on upstream failure.
-- Watchlist and holdings persist to `src/quant/dashboard/data/*.json` (git-ignored).
-Analyze `portfolio.csv` using cached prices first:
-
-```sh
-uv run quant portfolio
-```
-
-The portfolio CSV columns are `ticker`, `quantity`, and `cost`, where `cost` is
-the average cost per share. Symbols absent from the S&P 500 cache are downloaded
-in one batch and saved to `data/portfolio_market_data.parquet`.
-
-Analyze specific symbols with explicit trading-session windows and price basis:
-
-```sh
-uv run quant analyze AAPL MSFT --windows 5 20 --price adjusted
-```
-
-Use `--index` instead of ticker arguments to analyze the full cached S&P 500.
-Market analysis calculates daily price changes, simple moving averages, rolling
-highs/lows, volume averages, and relative volume. Full OHLC, adjusted close, and
-volume history is cached in `data/market_analysis.parquet`.
+Unit tests must mock Yahoo and Wikipedia boundaries; they should not require
+network access.

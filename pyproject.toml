@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.scripts]
-quant = "quant:main"
+quant = "quant.cli:main"
 quant-dashboard = "quant.dashboard:run"
 
 [build-system]

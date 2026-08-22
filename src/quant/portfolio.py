@@ -11,15 +11,36 @@ from quant.storage import DEFAULT_MARKET_DATA_PATH
 DEFAULT_PORTFOLIO_PATH = Path("portfolio.csv")
 DEFAULT_PORTFOLIO_MARKET_DATA_PATH = Path("data/portfolio_market_data.parquet")
 MARKET_DATA_COLUMNS = ["Date", "Symbol", "Last Price", "Volume"]
+OPTIONAL_PORTFOLIO_COLUMNS = {
+    "account": ("Account", pl.String),
+    "asset_class": ("Asset Class", pl.String),
+    "sector": ("Sector", pl.String),
+}
 
 
-def load_portfolio(path: Path = DEFAULT_PORTFOLIO_PATH) -> pl.DataFrame:
+def load_portfolio_lots(path: Path = DEFAULT_PORTFOLIO_PATH) -> pl.DataFrame:
     raw = pl.read_csv(path)
     required = {"ticker", "quantity", "cost"}
     missing = required.difference(raw.columns)
     if missing:
         raise ValueError(f"Missing portfolio columns: {', '.join(sorted(missing))}")
 
+    optional = [
+        (
+            pl.col(source).cast(dtype, strict=False).alias(target)
+            if source in raw.columns
+            else pl.lit(None, dtype=dtype).alias(target)
+        )
+        for source, (target, dtype) in OPTIONAL_PORTFOLIO_COLUMNS.items()
+    ]
+    acquired = (
+        pl.col("acquired")
+        .cast(pl.String)
+        .str.to_date(strict=False)
+        .alias("Acquired")
+        if "acquired" in raw.columns
+        else pl.lit(None, dtype=pl.Date).alias("Acquired")
+    )
     positions = raw.select(
         pl.col("ticker")
         .cast(pl.String)
@@ -28,6 +49,8 @@ def load_portfolio(path: Path = DEFAULT_PORTFOLIO_PATH) -> pl.DataFrame:
         .alias("Symbol"),
         pl.col("quantity").cast(pl.Float64, strict=False).alias("Quantity"),
         pl.col("cost").cast(pl.Float64, strict=False).alias("Average Cost"),
+        *optional,
+        acquired,
     )
     if positions.is_empty():
         raise ValueError("Portfolio is empty")
@@ -41,6 +64,11 @@ def load_portfolio(path: Path = DEFAULT_PORTFOLIO_PATH) -> pl.DataFrame:
     ).height:
         raise ValueError("Portfolio contains an invalid ticker, quantity, or cost")
 
+    return positions
+
+
+def load_portfolio(path: Path = DEFAULT_PORTFOLIO_PATH) -> pl.DataFrame:
+    positions = load_portfolio_lots(path)
     return (
         positions.with_columns(
             (pl.col("Quantity") * pl.col("Average Cost")).alias("Cost Basis")

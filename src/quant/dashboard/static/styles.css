@@ -233,6 +233,21 @@ a:hover { text-decoration: underline; }
 
 .scroll-y { max-height: 360px; overflow-y: auto; }
 
+.allocation-row + .allocation-row { margin-top: 10px; }
+.allocation-track {
+  height: 4px;
+  margin-top: 5px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--border);
+}
+.allocation-track span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+}
+
 .market-strip {
   border-top: 1px solid var(--border);
   background: var(--panel);

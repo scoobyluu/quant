@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import csv
-import json
 import math
 import time
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +10,8 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
+
+from quant.dashboard.services import DashboardService
 
 try:
     from curl_cffi import requests as curl_requests  # type: ignore
@@ -32,64 +31,10 @@ app.add_middleware(
 )
 
 
-DATA_DIR = Path(__file__).parent / "data"
-DATA_DIR.mkdir(exist_ok=True)
-HOLDINGS_FILE = DATA_DIR / "holdings.json"
-WATCHLIST_FILE = DATA_DIR / "watchlist.json"
-
-# portfolio.csv lives at the repo root and follows: ticker,quantity,cost
-PORTFOLIO_CSV = Path(__file__).resolve().parents[3] / "portfolio.csv"
-
-DEFAULT_WATCHLIST = ["AAPL", "MSFT", "NVDA", "GOOGL", "TSLA"]
-
 _cache: dict[str, tuple[float, Any]] = {}
 CACHE_TTL_SECONDS = 30
 STALE_TTL_SECONDS = 60 * 60
-
-
-def _load_json(path: Path, default: Any) -> Any:
-    if not path.exists():
-        return default
-    try:
-        return json.loads(path.read_text())
-    except json.JSONDecodeError:
-        return default
-
-
-def _save_json(path: Path, value: Any) -> None:
-    path.write_text(json.dumps(value, indent=2, default=str))
-
-
-def _seed_holdings_from_csv() -> list[dict]:
-    """One-time seed: convert portfolio.csv (ticker,quantity,cost) into holdings.json."""
-    if not PORTFOLIO_CSV.exists():
-        return []
-    seeded: list[dict] = []
-    with PORTFOLIO_CSV.open() as f:
-        for row in csv.DictReader(f):
-            symbol = (row.get("ticker") or "").strip().upper()
-            if not symbol:
-                continue
-            try:
-                shares = float(row.get("quantity") or 0)
-                cost = float(row.get("cost") or 0)
-            except ValueError:
-                continue
-            seeded.append(
-                {
-                    "id": str(uuid.uuid4()),
-                    "symbol": symbol,
-                    "shares": shares,
-                    "costBasis": cost,
-                }
-            )
-    if seeded:
-        _save_json(HOLDINGS_FILE, seeded)
-    return seeded
-
-
-if not HOLDINGS_FILE.exists():
-    _seed_holdings_from_csv()
+_dashboard_service = DashboardService()
 
 
 def _cached(key: str, producer):
@@ -486,7 +431,7 @@ def news_feed(symbols: str | None = Query(None, description="Comma-separated sym
     if symbols:
         syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
     else:
-        syms = _load_json(WATCHLIST_FILE, DEFAULT_WATCHLIST)
+        syms = _dashboard_service.watchlist()
     syms = syms[:10]
 
     def produce() -> dict:
@@ -563,26 +508,20 @@ class WatchlistAdd(BaseModel):
 
 @app.get("/api/watchlist")
 def watchlist_get() -> dict:
-    return {"symbols": _load_json(WATCHLIST_FILE, DEFAULT_WATCHLIST)}
+    return {"symbols": _dashboard_service.watchlist()}
 
 
 @app.post("/api/watchlist")
 def watchlist_add(body: WatchlistAdd) -> dict:
-    symbols: list[str] = _load_json(WATCHLIST_FILE, DEFAULT_WATCHLIST)
-    sym = body.symbol.upper().strip()
-    if sym and sym not in symbols:
-        symbols.append(sym)
-        _save_json(WATCHLIST_FILE, symbols)
-    return {"symbols": symbols}
+    try:
+        return {"symbols": _dashboard_service.add_watchlist(body.symbol)}
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
 
 
 @app.delete("/api/watchlist/{symbol}")
 def watchlist_remove(symbol: str) -> dict:
-    symbols: list[str] = _load_json(WATCHLIST_FILE, DEFAULT_WATCHLIST)
-    sym = symbol.upper()
-    symbols = [s for s in symbols if s != sym]
-    _save_json(WATCHLIST_FILE, symbols)
-    return {"symbols": symbols}
+    return {"symbols": _dashboard_service.remove_watchlist(symbol)}
 
 
 # ---- Holdings ----
@@ -592,82 +531,63 @@ class HoldingIn(BaseModel):
     symbol: str
     shares: float
     costBasis: float  # per-share cost
-
-
-class Holding(HoldingIn):
-    id: str
+    account: str | None = None
+    assetClass: str | None = None
+    sector: str | None = None
+    acquired: str | None = None
 
 
 @app.get("/api/holdings")
-def holdings_list() -> dict:
-    raw: list[dict] = _load_json(HOLDINGS_FILE, [])
-    enriched = []
-    total_cost = 0.0
-    total_value = 0.0
-    for h in raw:
-        sym = h["symbol"].upper()
-        try:
-            q = quote(sym)
-            price = q.get("price")
-        except HTTPException:
-            price = None
-        shares = float(h["shares"])
-        cost = float(h["costBasis"])
-        market_value = price * shares if price is not None else None
-        cost_value = cost * shares
-        gain = (market_value - cost_value) if market_value is not None else None
-        gain_pct = (gain / cost_value * 100) if (gain is not None and cost_value) else None
-        if market_value is not None:
-            total_value += market_value
-        total_cost += cost_value
-        enriched.append(
-            {
-                "id": h["id"],
-                "symbol": sym,
-                "shares": shares,
-                "costBasis": cost,
-                "price": price,
-                "marketValue": market_value,
-                "costValue": cost_value,
-                "gain": gain,
-                "gainPercent": gain_pct,
-            }
-        )
-    total_gain = total_value - total_cost if total_value else None
-    total_gain_pct = (total_gain / total_cost * 100) if (total_gain is not None and total_cost) else None
-    return _clean(
-        {
-            "holdings": enriched,
-            "totals": {
-                "cost": total_cost,
-                "value": total_value,
-                "gain": total_gain,
-                "gainPercent": total_gain_pct,
-            },
-        }
-    )
+def holdings_list(refresh: bool = False) -> dict:
+    try:
+        return _clean(_dashboard_service.holdings(refresh))
+    except (RuntimeError, ValueError) as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
 
 
 @app.post("/api/holdings")
 def holdings_add(body: HoldingIn) -> dict:
-    raw: list[dict] = _load_json(HOLDINGS_FILE, [])
-    holding = {
-        "id": str(uuid.uuid4()),
-        "symbol": body.symbol.upper().strip(),
-        "shares": body.shares,
-        "costBasis": body.costBasis,
-    }
-    raw.append(holding)
-    _save_json(HOLDINGS_FILE, raw)
-    return holding
+    try:
+        return _dashboard_service.add_holding(
+            body.symbol,
+            body.shares,
+            body.costBasis,
+            body.account,
+            body.assetClass,
+            body.sector,
+            body.acquired,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
 
 
 @app.delete("/api/holdings/{holding_id}")
 def holdings_remove(holding_id: str) -> dict:
-    raw: list[dict] = _load_json(HOLDINGS_FILE, [])
-    new_raw = [h for h in raw if h["id"] != holding_id]
-    _save_json(HOLDINGS_FILE, new_raw)
-    return {"removed": len(raw) - len(new_raw)}
+    return {"removed": int(_dashboard_service.remove_holding(holding_id))}
+
+
+@app.get("/api/analysis/{symbol}")
+def technical_analysis(
+    symbol: str,
+    windows: str = Query(..., description="Comma-separated trading sessions"),
+    price: str = Query(..., pattern="^(close|adjusted)$"),
+    refresh: bool = False,
+) -> dict:
+    try:
+        parsed_windows = list(
+            dict.fromkeys(int(value.strip()) for value in windows.split(","))
+        )
+        if not parsed_windows or any(window <= 0 for window in parsed_windows):
+            raise ValueError("Windows must be positive integers")
+        return _clean(
+            _dashboard_service.market_analysis(
+                symbol, parsed_windows, price, refresh
+            )
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
 
 
 # ---- Static frontend ----
