@@ -88,6 +88,71 @@ Routes:
 - `/api/*` — JSON API
 - `/docs` — auto-generated Swagger docs
 
+### Batch quote endpoints
+
+Fetching many symbols in one HTTP call avoids the browser's per-origin
+connection cap and lets the server parallelize upstream requests:
+
+```sh
+# every symbol in the persisted watchlist
+curl -s http://127.0.0.1:8001/api/watchlist/quotes
+
+# ad-hoc list (comma-separated, capped at 20)
+curl -s 'http://127.0.0.1:8001/api/quotes?symbols=AAPL,MSFT,NVDA'
+```
+
+Both return `{"quotes": [...]}` (watchlist also returns `"symbols"`). A symbol
+whose upstream fetch fails comes back as `{"symbol": "XYZ", "error": true}`
+instead of taking the whole response down.
+
+### Other API examples
+
+Per-symbol reads:
+
+```sh
+curl -s http://127.0.0.1:8001/api/quote/AAPL
+curl -s 'http://127.0.0.1:8001/api/history/AAPL?range=1y&interval=1d'
+curl -s http://127.0.0.1:8001/api/info/AAPL
+curl -s http://127.0.0.1:8001/api/analyst/AAPL
+curl -s http://127.0.0.1:8001/api/earnings/AAPL
+curl -s http://127.0.0.1:8001/api/options/AAPL
+```
+
+Aggregated news (defaults to the watchlist; pass `?symbols=` to override):
+
+```sh
+curl -s http://127.0.0.1:8001/api/news
+curl -s 'http://127.0.0.1:8001/api/news?symbols=AAPL,MSFT'
+curl -s http://127.0.0.1:8001/api/news/AAPL
+```
+
+Watchlist management:
+
+```sh
+curl -s http://127.0.0.1:8001/api/watchlist
+curl -s -X POST http://127.0.0.1:8001/api/watchlist \
+  -H 'content-type: application/json' \
+  -d '{"symbol":"NVDA"}'
+curl -s -X DELETE http://127.0.0.1:8001/api/watchlist/NVDA
+```
+
+Holdings management (`costBasis` is per-share):
+
+```sh
+curl -s http://127.0.0.1:8001/api/holdings
+curl -s -X POST http://127.0.0.1:8001/api/holdings \
+  -H 'content-type: application/json' \
+  -d '{"symbol":"AAPL","shares":10,"costBasis":150.25}'
+curl -s -X DELETE http://127.0.0.1:8001/api/holdings/<holding-id>
+```
+
+Symbol search and health:
+
+```sh
+curl -s 'http://127.0.0.1:8001/api/search?q=apple'
+curl -s http://127.0.0.1:8001/api/health
+```
+
 ### Holdings seeding
 
 On first run, `src/quant/dashboard/data/holdings.json` is auto-populated from `portfolio.csv` at the repo root. Only the `ticker`, `quantity`, and `cost` columns are read; extras are ignored.
@@ -103,5 +168,5 @@ uv run python -m pytest
 ## Notes
 
 - `yfinance` is unofficial and rate-limited; expect occasional 5xx responses from Yahoo.
-- The dashboard keeps a 30s in-memory cache and serves stale data for up to 1h on upstream failure.
+- The dashboard keeps a 30s in-memory cache (news feed is 5min, company names 24h) and serves stale data for up to 1h on upstream failure.
 - Watchlist and holdings persist to `src/quant/dashboard/data/*.json` (git-ignored).
