@@ -22,6 +22,7 @@ const api = {
     j(`/api/news${symbols && symbols.length ? `?symbols=${encodeURIComponent(symbols.join(","))}` : ""}`),
   search: (q) => j(`/api/search?q=${encodeURIComponent(q)}`),
   watchlistGet: () => j(`/api/watchlist`),
+  watchlistQuotes: () => j(`/api/watchlist/quotes`),
   watchlistAdd: (symbol) => j(`/api/watchlist`, "POST", { symbol }),
   watchlistRemove: (symbol) => j(`/api/watchlist/${encodeURIComponent(symbol)}`, "DELETE"),
   holdings: () => j(`/api/holdings`),
@@ -156,7 +157,14 @@ async function renderWatchlist() {
   }
 
   async function draw() {
-    const { symbols } = await api.watchlistGet();
+    let payload;
+    try {
+      payload = await api.watchlistQuotes();
+    } catch {
+      payload = { symbols: [], quotes: [] };
+    }
+    const symbols = payload.symbols || [];
+    const quotes = payload.quotes || [];
     const tbl = h(
       "table",
       {},
@@ -211,36 +219,40 @@ async function renderWatchlist() {
       }
     }
     panel.replaceChildren(tbl);
-    for (const sym of symbols) refreshRow(sym);
+    if (symbols.length) {
+      for (const q of quotes) fillRow(q);
+    }
   }
 
-  async function refreshRow(sym) {
-    try {
-      const q = await api.quote(sym);
-      const up = (q.change ?? 0) >= 0;
-      setText(`wname-${sym}`, q.name ?? "—");
-      setText(`wprice-${sym}`, fmtMoney(q.price, q.currency || "USD"));
-      const chg = document.getElementById(`wchg-${sym}`);
-      const pct = document.getElementById(`wpct-${sym}`);
-      if (chg) {
-        chg.textContent = fmtMoney(q.change ?? null, q.currency || "USD");
-        chg.className = up ? "up" : "down";
-      }
-      if (pct) {
-        pct.textContent = fmtPct(q.changePercent);
-        pct.className = up ? "up" : "down";
-      }
-      setText(`wvol-${sym}`, fmtNum(q.volume ?? null, 0));
-    } catch {
-      setText(`wprice-${sym}`, "err");
+  function fillRow(q) {
+    if (!q || !q.symbol || q.error) {
+      if (q && q.symbol) setText(`wprice-${q.symbol}`, "err");
+      return;
     }
+    const sym = q.symbol;
+    const up = (q.change ?? 0) >= 0;
+    setText(`wname-${sym}`, q.name ?? "—");
+    setText(`wprice-${sym}`, fmtMoney(q.price, q.currency || "USD"));
+    const chg = document.getElementById(`wchg-${sym}`);
+    const pct = document.getElementById(`wpct-${sym}`);
+    if (chg) {
+      chg.textContent = fmtMoney(q.change ?? null, q.currency || "USD");
+      chg.className = up ? "up" : "down";
+    }
+    if (pct) {
+      pct.textContent = fmtPct(q.changePercent);
+      pct.className = up ? "up" : "down";
+    }
+    setText(`wvol-${sym}`, fmtNum(q.volume ?? null, 0));
   }
 
   await draw();
   loadNews();
   watchlistTimer = setInterval(async () => {
-    const { symbols } = await api.watchlistGet();
-    for (const s of symbols) refreshRow(s);
+    try {
+      const { quotes } = await api.watchlistQuotes();
+      for (const q of quotes || []) fillRow(q);
+    } catch {}
   }, 30000);
 }
 

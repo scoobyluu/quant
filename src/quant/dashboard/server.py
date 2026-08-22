@@ -46,6 +46,7 @@ DEFAULT_WATCHLIST = ["AAPL", "MSFT", "NVDA", "GOOGL", "TSLA"]
 _cache: dict[str, tuple[float, Any]] = {}
 CACHE_TTL_SECONDS = 30
 NEWS_TTL_SECONDS = 60 * 5  # news changes slower than quotes; cache longer
+NAME_TTL_SECONDS = 60 * 60 * 24  # company names effectively never change
 STALE_TTL_SECONDS = 60 * 60
 
 
@@ -168,17 +169,73 @@ def quotes(symbols: str = Query(..., description="Comma-separated symbols")) -> 
     return {"quotes": results}
 
 
+def _fi_get(fi: Any, *keys: str) -> Any:
+    """Read a field from a yfinance FastInfo (supports attr and dict access)."""
+    for k in keys:
+        try:
+            if hasattr(fi, k):
+                v = getattr(fi, k)
+                if v is not None:
+                    return v
+            if hasattr(fi, "get"):
+                v = fi.get(k)
+                if v is not None:
+                    return v
+        except Exception:
+            pass
+    return None
+
+
+def _name(symbol: str) -> str | None:
+    """Long-cached company name. Falls back to None on failure."""
+    def produce() -> str | None:
+        info = _ticker(symbol).info or {}
+        return info.get("shortName") or info.get("longName")
+
+    try:
+        return _cached(f"name:{symbol.upper()}", produce, ttl=NAME_TTL_SECONDS)
+    except Exception:
+        return None
+
+
 @app.get("/api/quote/{symbol}")
 def quote(symbol: str) -> dict:
     def produce() -> dict:
         t = _ticker(symbol)
-        info = t.info or {}
-        price = (
-            info.get("regularMarketPrice")
-            or info.get("currentPrice")
-            or info.get("previousClose")
-        )
-        prev = info.get("regularMarketPreviousClose") or info.get("previousClose")
+
+        # Fetch fast_info and the (long-cached) name in parallel so cold requests
+        # aren't gated by the name lookup.
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            fi_fut = ex.submit(lambda: t.fast_info)
+            name_fut = ex.submit(_name, symbol)
+            try:
+                fi = fi_fut.result()
+            except Exception:
+                fi = None
+            name = name_fut.result()
+
+        price = _fi_get(fi, "last_price", "lastPrice", "regular_market_price")
+        prev = _fi_get(fi, "previous_close", "regular_market_previous_close")
+        day_high = _fi_get(fi, "day_high", "dayHigh")
+        day_low = _fi_get(fi, "day_low", "dayLow")
+        volume = _fi_get(fi, "last_volume", "regular_market_volume", "volume")
+        currency = _fi_get(fi, "currency")
+
+        # fast_info doesn't expose marketState; if we need to backfill any missing
+        # volatile field, fall back to the slower .info path once.
+        if price is None:
+            info = t.info or {}
+            price = (
+                info.get("regularMarketPrice")
+                or info.get("currentPrice")
+                or info.get("previousClose")
+            )
+            prev = prev or info.get("regularMarketPreviousClose") or info.get("previousClose")
+            day_high = day_high or info.get("dayHigh")
+            day_low = day_low or info.get("dayLow")
+            volume = volume or info.get("volume") or info.get("regularMarketVolume")
+            currency = currency or info.get("currency")
+
         change = None
         change_pct = None
         if price is not None and prev:
@@ -187,16 +244,16 @@ def quote(symbol: str) -> dict:
         return _clean(
             {
                 "symbol": symbol.upper(),
-                "name": info.get("shortName") or info.get("longName"),
+                "name": name,
                 "price": price,
                 "previousClose": prev,
                 "change": change,
                 "changePercent": change_pct,
-                "currency": info.get("currency"),
-                "marketState": info.get("marketState"),
-                "dayHigh": info.get("dayHigh"),
-                "dayLow": info.get("dayLow"),
-                "volume": info.get("volume") or info.get("regularMarketVolume"),
+                "currency": currency,
+                "marketState": None,
+                "dayHigh": day_high,
+                "dayLow": day_low,
+                "volume": volume,
             }
         )
 
