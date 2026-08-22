@@ -59,6 +59,17 @@ The portfolio CSV columns are `ticker`, `quantity`, and `cost`, where `cost` is
 the average cost per share. Symbols absent from the S&P 500 cache are downloaded
 in one batch and saved to `data/portfolio_market_data.parquet`.
 
+Analyze specific symbols with explicit trading-session windows and price basis:
+
+```sh
+uv run quant analyze AAPL MSFT --windows 5 20 --price adjusted
+```
+
+Use `--index` instead of ticker arguments to analyze the full cached S&P 500.
+Market analysis calculates daily price changes, simple moving averages, rolling
+highs/lows, volume averages, and relative volume. Full OHLC, adjusted close, and
+volume history is cached in `data/market_analysis.parquet`.
+
 ## Run the dashboard
 
 ```sh

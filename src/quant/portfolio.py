@@ -4,8 +4,8 @@ from pathlib import Path
 import polars as pl
 
 from quant.analysis import analyze_portfolio
-from quant.market_data import get_market_history
-from quant.storage import DEFAULT_MARKET_DATA_PATH, load_market_data, save_market_data
+from quant.quotes import resolve_market_history
+from quant.storage import DEFAULT_MARKET_DATA_PATH
 
 
 DEFAULT_PORTFOLIO_PATH = Path("portfolio.csv")
@@ -63,39 +63,13 @@ def load_portfolio_market_data(
     portfolio_cache_path: Path = DEFAULT_PORTFOLIO_MARKET_DATA_PATH,
     refresh: bool = False,
 ) -> pl.DataFrame:
-    symbols = list(dict.fromkeys(symbols))
-    cached = []
-    if market_cache_path.exists():
-        cached.append(load_market_data(market_cache_path).select(MARKET_DATA_COLUMNS))
-    if portfolio_cache_path.exists():
-        cached.append(load_market_data(portfolio_cache_path).select(MARKET_DATA_COLUMNS))
-
-    market_data = _combine_market_data(cached)
-    available = (
-        set(
-            market_data.filter(pl.col("Last Price").is_not_null())
-            .get_column("Symbol")
-            .unique()
-            .to_list()
-        )
-        if market_data.height
-        else set()
+    return resolve_market_history(
+        symbols,
+        [market_cache_path, portfolio_cache_path],
+        portfolio_cache_path,
+        MARKET_DATA_COLUMNS,
+        refresh=refresh,
     )
-    symbols_to_download = symbols if refresh else [s for s in symbols if s not in available]
-    if symbols_to_download:
-        downloaded = get_market_history(symbols_to_download).select(MARKET_DATA_COLUMNS)
-        portfolio_data = _combine_market_data(
-            [
-                load_market_data(portfolio_cache_path).select(MARKET_DATA_COLUMNS)
-                if portfolio_cache_path.exists()
-                else _empty_market_data(),
-                downloaded,
-            ]
-        )
-        save_market_data(portfolio_data, portfolio_cache_path)
-        market_data = _combine_market_data([market_data, downloaded])
-
-    return market_data.filter(pl.col("Symbol").is_in(symbols))
 
 
 def analyze_portfolio_file(
@@ -112,24 +86,3 @@ def analyze_portfolio_file(
         refresh,
     )
     return analyze_portfolio(positions, market_data)
-
-
-def _combine_market_data(frames: list[pl.DataFrame]) -> pl.DataFrame:
-    if not frames:
-        return _empty_market_data()
-    return (
-        pl.concat(frames)
-        .unique(subset=["Date", "Symbol"], keep="last", maintain_order=True)
-        .sort(["Date", "Symbol"])
-    )
-
-
-def _empty_market_data() -> pl.DataFrame:
-    return pl.DataFrame(
-        schema={
-            "Date": pl.Date,
-            "Symbol": pl.String,
-            "Last Price": pl.Float64,
-            "Volume": pl.Int64,
-        }
-    )
