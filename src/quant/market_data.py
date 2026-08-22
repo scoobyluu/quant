@@ -1,4 +1,5 @@
 from collections.abc import Iterable
+from datetime import date
 import math
 from urllib.request import Request, urlopen
 
@@ -10,6 +11,17 @@ import yfinance as yf
 S_AND_P_500_CONSTITUENTS_URL = (
     "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 )
+MARKET_DATA_SCHEMA = {
+    "Date": pl.Date,
+    "Symbol": pl.String,
+    "Open": pl.Float64,
+    "High": pl.Float64,
+    "Low": pl.Float64,
+    "Close": pl.Float64,
+    "Adjusted Close": pl.Float64,
+    "Last Price": pl.Float64,
+    "Volume": pl.Int64,
+}
 
 
 def get_sp500_constituents() -> pl.DataFrame:
@@ -40,63 +52,78 @@ def get_sp500_constituents() -> pl.DataFrame:
     )
 
 
-def get_market_history(symbols: Iterable[str]) -> pl.DataFrame:
+def get_market_history(
+    symbols: Iterable[str],
+    start: date | None = None,
+) -> pl.DataFrame:
     symbols = list(dict.fromkeys(symbols))
     if not symbols:
-        return pl.DataFrame(
-            schema={
-                "Date": pl.Date,
-                "Symbol": pl.String,
-                "Last Price": pl.Float64,
-                "Volume": pl.Int64,
-            }
-        )
+        return pl.DataFrame(schema=MARKET_DATA_SCHEMA)
 
     # Yahoo uses dashes for share classes while the index uses dots.
     yahoo_to_index_symbol = {symbol.replace(".", "-"): symbol for symbol in symbols}
-    history = yf.download(
-        tickers=list(yahoo_to_index_symbol),
-        period="5d",
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        threads=True,
-        group_by="column",
-    )
+    download_options = {
+        "tickers": list(yahoo_to_index_symbol),
+        "interval": "1d",
+        "auto_adjust": False,
+        "progress": False,
+        "threads": True,
+        "group_by": "column",
+    }
+    if start is None:
+        download_options["period"] = "5d"
+    else:
+        download_options["start"] = start
+    history = yf.download(**download_options)
     if history.empty:
-        raise RuntimeError("No market data returned for the S&P 500 constituents")
+        raise RuntimeError(f"No market data returned for: {', '.join(symbols)}")
 
-    closes = history["Close"]
-    volumes = history["Volume"]
+    fields = {
+        "Open": history["Open"],
+        "High": history["High"],
+        "Low": history["Low"],
+        "Close": history["Close"],
+        "Adjusted Close": history["Adj Close"],
+        "Volume": history["Volume"],
+    }
+    closes = fields["Close"]
     rows = []
     for yahoo_symbol, index_symbol in yahoo_to_index_symbol.items():
         if yahoo_symbol not in closes.columns:
             continue
 
         prices = closes[yahoo_symbol].dropna()
-        for date, price in prices.items():
-            volume = volumes.at[date, yahoo_symbol]
+        for trading_date, price in prices.items():
+            values = {
+                name: columns.at[trading_date, yahoo_symbol]
+                for name, columns in fields.items()
+            }
             rows.append(
                 {
-                    "Date": date.date() if hasattr(date, "date") else date,
+                    "Date": (
+                        trading_date.date()
+                        if hasattr(trading_date, "date")
+                        else trading_date
+                    ),
                     "Symbol": index_symbol,
+                    "Open": _optional_float(values["Open"]),
+                    "High": _optional_float(values["High"]),
+                    "Low": _optional_float(values["Low"]),
+                    "Close": float(price),
+                    "Adjusted Close": _optional_float(values["Adjusted Close"]),
                     "Last Price": float(price),
                     "Volume": (
                         None
-                        if volume is None or math.isnan(float(volume))
-                        else int(volume)
+                        if values["Volume"] is None
+                        or math.isnan(float(values["Volume"]))
+                        else int(values["Volume"])
                     ),
                 }
             )
 
     return pl.DataFrame(
         rows,
-        schema={
-            "Date": pl.Date,
-            "Symbol": pl.String,
-            "Last Price": pl.Float64,
-            "Volume": pl.Int64,
-        },
+        schema=MARKET_DATA_SCHEMA,
     ).sort(["Date", "Symbol"])
 
 
@@ -142,4 +169,21 @@ def get_sp500_market_history() -> pl.DataFrame:
         on="Symbol",
         how="left",
         validate="1:m",
-    ).select("Date", "Symbol", "Company", "Last Price", "Volume")
+    ).select(
+        "Date",
+        "Symbol",
+        "Company",
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Adjusted Close",
+        "Last Price",
+        "Volume",
+    )
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None or math.isnan(float(value)):
+        return None
+    return float(value)

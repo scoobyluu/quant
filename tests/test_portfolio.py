@@ -28,7 +28,7 @@ class PortfolioInputTests(unittest.TestCase):
             {"Symbol": "AAPL", "Quantity": 3.0, "Average Cost": 110.0}
         ])
 
-    @patch("quant.portfolio.get_market_history")
+    @patch("quant.quotes.get_market_history")
     def test_downloads_and_caches_only_missing_symbols(self, get_market_history) -> None:
         primary_data = pl.DataFrame(
             {
