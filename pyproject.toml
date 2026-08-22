@@ -8,13 +8,17 @@ authors = [
 ]
 requires-python = ">=3.14"
 dependencies = [
+    "fastapi>=0.115.5",
     "lxml>=6.1.2",
     "polars>=1.43.2",
+    "pydantic>=2.10.3",
+    "uvicorn[standard]>=0.32.1",
     "yfinance>=1.6.0",
 ]
 
 [project.scripts]
 quant = "quant:main"
+quant-dashboard = "quant.dashboard:run"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]

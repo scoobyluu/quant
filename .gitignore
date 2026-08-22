@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+.venv/
+src/quant/dashboard/data/*.json
