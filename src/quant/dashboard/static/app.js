@@ -33,6 +33,8 @@ const api = {
   portfolioAnalytics: (period = "1y") =>
     j(`/api/portfolio/analytics?period=${encodeURIComponent(period)}`),
   watchlistAnalytics: () => j(`/api/watchlist/analytics`),
+  symbolAnalytics: (s, period = "1y") =>
+    j(`/api/analytics/${encodeURIComponent(s)}?period=${encodeURIComponent(period)}`),
 };
 
 async function j(path, method = "GET", body) {
@@ -669,15 +671,16 @@ async function renderStock(symbol) {
   // Placeholders for subsequent panels; filled as data arrives.
   const earningsBannerSlot = h("div");
   const analystSlot = h("div");
+  const riskSlot = h("div");
   const earningsHistorySlot = h("div");
   const aboutSlot = h("div");
   const metricsSlot = h("div");
   const optionsSlot = h("div", { class: "panel" }, h("div", { class: "muted" }, "Loading options…"));
   const newsSlot = h("div", { class: "panel" }, h("div", { class: "muted" }, "Loading news…"));
   const bottomGrid = h("div", { class: "grid cols-2" }, optionsSlot, newsSlot);
-  // Order: banner -> chart (above) -> analyst -> earnings history -> about -> metrics -> bottom.
+  // Order: banner -> chart (above) -> analyst -> risk & return -> earnings history -> about -> metrics -> bottom.
   root.insertBefore(earningsBannerSlot, chartPanel);
-  root.append(analystSlot, earningsHistorySlot, aboutSlot, metricsSlot, bottomGrid);
+  root.append(analystSlot, riskSlot, earningsHistorySlot, aboutSlot, metricsSlot, bottomGrid);
 
   const currentPrice = await loadQuote();
   loadChart();
@@ -690,6 +693,14 @@ async function renderStock(symbol) {
   } catch (e) {
     analystSlot.replaceChildren(h("div", { class: "panel error" }, `Analyst data unavailable: ${e.message}`));
   }
+
+  // Risk & Return (parallel — don't block the rest of the page)
+  api
+    .symbolAnalytics(symbol, "1y")
+    .then((a) => riskSlot.replaceChildren(renderSymbolRisk(a)))
+    .catch((e) =>
+      riskSlot.replaceChildren(h("div", { class: "panel error" }, `Risk metrics unavailable: ${e.message}`))
+    );
 
   // Info (about + metrics)
   try {
@@ -1534,6 +1545,52 @@ async function renderHoldings() {
   await draw();
   loadAnalytics();
   holdingsTimer = setInterval(draw, 30000);
+}
+
+function renderSymbolRisk(a) {
+  const m = a.metrics || {};
+  const bench = a.benchmark || "SPY";
+  const period = a.period || "1y";
+  const hasAny = Object.values(m).some((v) => typeof v === "number");
+  if (!hasAny) {
+    return h(
+      "div",
+      { class: "panel muted small" },
+      "Risk metrics unavailable — not enough price history."
+    );
+  }
+  function num(v, d = 2) {
+    return typeof v === "number" ? fmtNum(v, d) : "—";
+  }
+  function pct(v) {
+    return typeof v === "number" ? fmtPct(v * 100) : "—";
+  }
+  const cumUp = (m.cumulativeReturn ?? 0) >= 0;
+  const oneUp = (m.oneMonth ?? 0) >= 0;
+  const ytdUp = (m.ytd ?? 0) >= 0;
+  const alphaUp = (m.alpha ?? 0) >= 0;
+  return h(
+    "div",
+    { class: "panel stack" },
+    h(
+      "div",
+      { class: "row between", style: { alignItems: "baseline" } },
+      h("h2", { style: { margin: 0 } }, "Risk & Return"),
+      h("div", { class: "muted small" }, `${period} · vs ${bench}`)
+    ),
+    h(
+      "div",
+      { class: "grid cols-4" },
+      kpiCard(`Return (${period})`, pct(m.cumulativeReturn), cumUp ? "up" : "down"),
+      kpiCard("1M", pct(m.oneMonth), oneUp ? "up" : "down"),
+      kpiCard("YTD", pct(m.ytd), ytdUp ? "up" : "down"),
+      kpiCard("Sharpe", num(m.sharpe)),
+      kpiCard("Sortino", num(m.sortino)),
+      kpiCard("Volatility", pct(m.volatility)),
+      kpiCard("Max drawdown", pct(m.maxDrawdown), "down"),
+      kpiCard(`Beta vs ${bench}`, num(m.beta))
+    )
+  );
 }
 
 function renderPortfolioKpis(a) {

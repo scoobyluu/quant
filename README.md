@@ -153,6 +153,34 @@ curl -s 'http://127.0.0.1:8001/api/search?q=apple'
 curl -s http://127.0.0.1:8001/api/health
 ```
 
+### Analytics endpoints
+
+Risk-adjusted return metrics computed from adjusted-close history. All three
+endpoints share a 15-minute price-history cache, so subsequent calls are
+cheap.
+
+```sh
+# Per-symbol: Sharpe, Sortino, vol, max drawdown, 1M/YTD returns, beta vs SPY.
+curl -s 'http://127.0.0.1:8001/api/analytics/AAPL?period=1y'
+
+# Every watchlist symbol: 1M %, YTD %, Sharpe, and annualized vol (1Y window).
+curl -s http://127.0.0.1:8001/api/watchlist/analytics
+
+# Portfolio-level: KPIs, cumulative return curve vs SPY, correlation matrix,
+# and per-holding weight / return / return-contribution / risk-contribution.
+curl -s 'http://127.0.0.1:8001/api/portfolio/analytics?period=1y'
+```
+
+Modeling notes:
+
+- Portfolio return series assumes today's shares were held throughout `period`
+  (standard dashboard simplification, not a real historical P&L).
+- Sharpe / Sortino are excess-over-zero — no risk-free rate applied.
+- Beta is regressed on daily returns aligned by date; alpha is the annualized
+  daily intercept.
+- Risk contributions sum to ≈1 (not exactly, since the portfolio return series
+  reflects drifting weights while the decomposition uses current weights).
+
 ### Holdings seeding
 
 On first run, `src/quant/dashboard/data/holdings.json` is auto-populated from `portfolio.csv` at the repo root. Only the `ticker`, `quantity`, and `cost` columns are read; extras are ignored.

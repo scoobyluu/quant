@@ -918,6 +918,61 @@ def _ytd_start_iso(latest_iso: str) -> str:
     return f"{latest_iso[:4]}-01-01"
 
 
+@app.get("/api/analytics/{symbol}")
+def symbol_analytics(
+    symbol: str,
+    period: str = Query("1y", description="1mo,3mo,6mo,1y,2y,5y,10y,ytd,max"),
+) -> dict:
+    """Risk-adjusted return metrics for a single symbol, plus beta/alpha vs SPY."""
+    def fetch(sym: str) -> list[tuple[str, float]]:
+        try:
+            return _daily_closes(sym, period)
+        except Exception:
+            return []
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        closes_fut = ex.submit(fetch, symbol)
+        bench_fut = ex.submit(fetch, BENCHMARK_SYMBOL)
+        closes = closes_fut.result()
+        bench = bench_fut.result()
+
+    if len(closes) < 2:
+        return _clean(
+            {
+                "symbol": symbol.upper(),
+                "period": period,
+                "benchmark": BENCHMARK_SYMBOL,
+                "metrics": {},
+            }
+        )
+
+    returns_by_date = _returns_by_date(closes)
+    stats = _stats_from_returns(list(returns_by_date.values()))
+    latest = closes[-1][0]
+    one_month = _range_return(closes, _month_ago_iso(latest))
+    ytd = _range_return(closes, _ytd_start_iso(latest))
+
+    beta: float | None = None
+    alpha: float | None = None
+    if bench:
+        beta, alpha = _beta_alpha(returns_by_date, _returns_by_date(bench))
+
+    return _clean(
+        {
+            "symbol": symbol.upper(),
+            "period": period,
+            "benchmark": BENCHMARK_SYMBOL,
+            "metrics": {
+                **stats,
+                "oneMonth": one_month,
+                "ytd": ytd,
+                "beta": beta,
+                "alpha": alpha,
+            },
+        }
+    )
+
+
 # ---- Watchlist ----
 
 
