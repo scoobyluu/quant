@@ -734,6 +734,112 @@ def _returns_by_date(closes: list[tuple[str, float]]) -> dict[str, float]:
     return out
 
 
+def _correlation_matrix(
+    returns_by_symbol: dict[str, dict[str, float]],
+) -> tuple[list[str], list[list[float | None]]]:
+    """Pearson correlation on each pair's intersecting dates."""
+    syms = sorted(returns_by_symbol.keys())
+    n = len(syms)
+    matrix: list[list[float | None]] = [[None] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                matrix[i][j] = 1.0
+                continue
+            if j < i:
+                matrix[i][j] = matrix[j][i]
+                continue
+            a = returns_by_symbol[syms[i]]
+            b = returns_by_symbol[syms[j]]
+            common = sorted(set(a) & set(b))
+            if len(common) < 2:
+                continue
+            x = [a[d] for d in common]
+            y = [b[d] for d in common]
+            k = len(x)
+            mx = sum(x) / k
+            my = sum(y) / k
+            sx2 = sum((xi - mx) ** 2 for xi in x)
+            sy2 = sum((yi - my) ** 2 for yi in y)
+            if sx2 == 0 or sy2 == 0:
+                continue
+            cov = sum((x[t] - mx) * (y[t] - my) for t in range(k))
+            matrix[i][j] = cov / math.sqrt(sx2 * sy2)
+    return syms, matrix
+
+
+def _contributions(
+    holdings: list[dict],
+    histories: dict[str, list[tuple[str, float]]],
+    returns_by_symbol: dict[str, dict[str, float]],
+    port_returns_by_date: dict[str, float],
+) -> list[dict]:
+    """Per-symbol weight, period return, return contribution, risk contribution.
+
+    Risk contribution uses w_i · cov(r_i, r_p) / var(r_p). By construction the
+    contributions sum to 1 (100%), matching the standard variance decomposition.
+    """
+    # Sum shares across lots so a multi-lot ticker appears once.
+    shares_by_sym: dict[str, float] = {}
+    for hd in holdings:
+        sym = hd["symbol"].upper()
+        shares_by_sym[sym] = shares_by_sym.get(sym, 0.0) + float(hd["shares"])
+
+    current_value: dict[str, float] = {}
+    total_value = 0.0
+    for sym, shares in shares_by_sym.items():
+        series = histories.get(sym) or []
+        if not series:
+            continue
+        v = shares * series[-1][1]
+        current_value[sym] = v
+        total_value += v
+    if total_value == 0:
+        return []
+
+    port_dates = list(port_returns_by_date.keys())
+    if len(port_dates) >= 2:
+        p_vals = list(port_returns_by_date.values())
+        p_mean = sum(p_vals) / len(p_vals)
+        p_var = sum((r - p_mean) ** 2 for r in p_vals) / len(p_vals)
+    else:
+        p_mean = 0.0
+        p_var = 0.0
+
+    out: list[dict] = []
+    for sym, shares in shares_by_sym.items():
+        series = histories.get(sym) or []
+        weight = current_value.get(sym, 0.0) / total_value if total_value else None
+        symbol_return: float | None = None
+        if series and series[0][1]:
+            symbol_return = series[-1][1] / series[0][1] - 1.0
+        return_contribution = (
+            (weight or 0.0) * symbol_return if symbol_return is not None else None
+        )
+        risk_contribution = None
+        sym_returns = returns_by_symbol.get(sym) or {}
+        if p_var > 0 and sym_returns:
+            common = sorted(set(sym_returns) & set(port_returns_by_date))
+            if len(common) >= 2:
+                x = [sym_returns[d] for d in common]
+                p = [port_returns_by_date[d] for d in common]
+                mx = sum(x) / len(x)
+                mp = sum(p) / len(p)
+                cov = sum((x[k] - mx) * (p[k] - mp) for k in range(len(x))) / len(x)
+                risk_contribution = (weight or 0.0) * cov / p_var
+        out.append(
+            {
+                "symbol": sym,
+                "weight": weight,
+                "return": symbol_return,
+                "returnContribution": return_contribution,
+                "riskContribution": risk_contribution,
+            }
+        )
+    out.sort(key=lambda r: r.get("weight") or 0.0, reverse=True)
+    return out
+
+
 def _portfolio_value_series(
     holdings: list[dict], histories: dict[str, list[tuple[str, float]]]
 ) -> dict[str, float]:
@@ -1046,12 +1152,27 @@ def portfolio_analytics(period: str = Query("1y", description="1mo,3mo,6mo,1y,2y
         "benchmarkReturn": bench_return,
     }
 
+    # Correlation matrix includes the benchmark for a visual anchor row/col.
+    returns_by_symbol: dict[str, dict[str, float]] = {
+        sym: _returns_by_date(series) for sym, series in histories.items() if series
+    }
+    corr_input = dict(returns_by_symbol)
+    if bench_returns_by_date:
+        corr_input[BENCHMARK_SYMBOL] = bench_returns_by_date
+    corr_syms, corr_matrix = _correlation_matrix(corr_input)
+
+    contributions = _contributions(
+        raw, histories, returns_by_symbol, port_returns_by_date
+    )
+
     return _clean(
         {
             "period": period,
             "benchmark": BENCHMARK_SYMBOL,
             "kpis": kpis,
             "curve": curve,
+            "correlation": {"symbols": corr_syms, "matrix": corr_matrix},
+            "contributions": contributions,
         }
     )
 

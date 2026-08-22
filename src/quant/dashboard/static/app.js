@@ -1274,9 +1274,20 @@ async function renderHoldings() {
   const totalsSlot = h("div");
   const analyticsSlot = h("div");
   const chartSlot = h("div");
+  const contribSlot = h("div");
+  const corrSlot = h("div");
   const form = h("div");
   const tableSlot = h("div", { class: "panel", style: { padding: 0, overflow: "hidden" } });
-  root.append(head, totalsSlot, analyticsSlot, chartSlot, form, tableSlot);
+  root.append(
+    head,
+    totalsSlot,
+    analyticsSlot,
+    chartSlot,
+    contribSlot,
+    corrSlot,
+    form,
+    tableSlot
+  );
   let analyticsChart = null;
 
   function mountForm() {
@@ -1508,11 +1519,15 @@ async function renderHoldings() {
       const a = await api.portfolioAnalytics("1y");
       analyticsSlot.replaceChildren(renderPortfolioKpis(a));
       chartSlot.replaceChildren(renderPortfolioCurve(a, (chart) => (analyticsChart = chart)));
+      contribSlot.replaceChildren(renderContributions(a));
+      corrSlot.replaceChildren(renderCorrelation(a));
     } catch (e) {
       analyticsSlot.replaceChildren(
         h("div", { class: "panel error" }, `Analytics unavailable: ${e.message}`)
       );
       chartSlot.replaceChildren();
+      contribSlot.replaceChildren();
+      corrSlot.replaceChildren();
     }
   }
 
@@ -1559,6 +1574,148 @@ function kpiCard(label, value, cls = "") {
     h("div", { class: "muted small" }, label),
     h("div", { class: cls, style: { fontSize: "18px", fontWeight: "600" } }, value)
   );
+}
+
+function renderContributions(a) {
+  const rows = a.contributions || [];
+  const panel = h(
+    "div",
+    { class: "panel stack" },
+    h("h2", {}, "Per-holding contributions"),
+    h(
+      "div",
+      { class: "muted small" },
+      `Weight from current market value. Return contribution ≈ weight × period return. Risk contribution = wᵢ·cov(rᵢ, rₚ) / var(rₚ); sums to ~1.`
+    )
+  );
+  if (!rows.length) {
+    panel.append(h("div", { class: "muted" }, "Add holdings with enough history to see contributions."));
+    return panel;
+  }
+  const body = h("tbody", {});
+  for (const r of rows) {
+    const retUp = (r.return ?? 0) >= 0;
+    const rcUp = (r.returnContribution ?? 0) >= 0;
+    body.append(
+      h(
+        "tr",
+        {},
+        h("td", {}, h("a", { href: `#/stock/${r.symbol}` }, r.symbol)),
+        h("td", {}, typeof r.weight === "number" ? fmtPct(r.weight * 100) : "—"),
+        h(
+          "td",
+          { class: retUp ? "up" : "down" },
+          typeof r.return === "number" ? fmtPct(r.return * 100) : "—"
+        ),
+        h(
+          "td",
+          { class: rcUp ? "up" : "down" },
+          typeof r.returnContribution === "number"
+            ? fmtPct(r.returnContribution * 100)
+            : "—"
+        ),
+        h(
+          "td",
+          {},
+          typeof r.riskContribution === "number"
+            ? fmtPct(r.riskContribution * 100)
+            : "—"
+        )
+      )
+    );
+  }
+  panel.append(
+    h(
+      "table",
+      {},
+      h(
+        "thead",
+        {},
+        h(
+          "tr",
+          {},
+          h("th", {}, "Symbol"),
+          h("th", {}, "Weight"),
+          h("th", {}, `Return (${a.period || "1y"})`),
+          h("th", {}, "Contribution to return"),
+          h("th", {}, "Contribution to risk")
+        )
+      ),
+      body
+    )
+  );
+  return panel;
+}
+
+function corrColor(v) {
+  if (typeof v !== "number") return "transparent";
+  const a = Math.min(1, Math.abs(v));
+  // Blue for positive, red for negative; saturate with |corr|.
+  if (v >= 0) return `rgba(79, 140, 255, ${(a * 0.75).toFixed(3)})`;
+  return `rgba(239, 68, 68, ${(a * 0.75).toFixed(3)})`;
+}
+
+function renderCorrelation(a) {
+  const corr = a.correlation || {};
+  const syms = corr.symbols || [];
+  const matrix = corr.matrix || [];
+  const panel = h(
+    "div",
+    { class: "panel stack" },
+    h("h2", {}, `Correlation matrix (${a.period || "1y"})`),
+    h(
+      "div",
+      { class: "muted small" },
+      "Pearson correlation of daily returns. Blue = move together, red = move opposite. SPY included as an anchor."
+    )
+  );
+  if (syms.length < 2) {
+    panel.append(h("div", { class: "muted" }, "Need at least two symbols with history to compute correlations."));
+    return panel;
+  }
+  const cellSize = "48px";
+  const cellStyle = {
+    width: cellSize,
+    height: cellSize,
+    textAlign: "center",
+    verticalAlign: "middle",
+    padding: "4px",
+    fontSize: "12px",
+    fontVariantNumeric: "tabular-nums",
+  };
+  const head = h("tr", {}, h("th", {}));
+  for (const s of syms) head.append(h("th", { style: { textAlign: "center", padding: "4px" } }, s));
+  const body = h("tbody", {});
+  for (let i = 0; i < syms.length; i++) {
+    const row = h("tr", {}, h("th", { style: { textAlign: "right", padding: "4px" } }, syms[i]));
+    for (let j = 0; j < syms.length; j++) {
+      const v = matrix[i]?.[j];
+      row.append(
+        h(
+          "td",
+          {
+            style: { ...cellStyle, background: corrColor(v) },
+            title: `${syms[i]} · ${syms[j]}`,
+          },
+          typeof v === "number" ? v.toFixed(2) : "—"
+        )
+      );
+    }
+    body.append(row);
+  }
+  panel.append(
+    h(
+      "div",
+      { style: { overflowX: "auto" } },
+      h(
+        "table",
+        { style: { borderCollapse: "collapse", width: "auto" } },
+        h("thead", {}, head),
+        body
+      )
+    )
+  );
+  return panel;
 }
 
 function renderPortfolioCurve(a, onChart) {
