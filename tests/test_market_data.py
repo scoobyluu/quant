@@ -38,7 +38,19 @@ class FakeHistory:
     def __init__(self) -> None:
         trading_date = date(2026, 8, 21)
         self.columns = {
+            "Open": FakeColumns(
+                {"BRK-B": 498.0, "AAPL": 223.0}, trading_date
+            ),
+            "High": FakeColumns(
+                {"BRK-B": 501.0, "AAPL": 226.0}, trading_date
+            ),
+            "Low": FakeColumns(
+                {"BRK-B": 497.0, "AAPL": 222.0}, trading_date
+            ),
             "Close": FakeColumns(
+                {"BRK-B": 500.25, "AAPL": 225.50}, trading_date
+            ),
+            "Adj Close": FakeColumns(
                 {"BRK-B": 500.25, "AAPL": 225.50}, trading_date
             ),
             "Volume": FakeColumns(
@@ -58,7 +70,7 @@ class LatestMarketDataTests(unittest.TestCase):
         download.assert_called_once()
         self.assertEqual(download.call_args.kwargs["tickers"], ["BRK-B", "AAPL"])
         self.assertEqual(
-            result.to_dicts(),
+            result.select("Symbol", "Last Price", "Volume").to_dicts(),
             [
                 {"Symbol": "BRK.B", "Last Price": 500.25, "Volume": 1_000_000},
                 {"Symbol": "AAPL", "Last Price": 225.50, "Volume": 2_000_000},

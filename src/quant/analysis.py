@@ -3,6 +3,18 @@ import polars as pl
 from quant.market_data import latest_market_snapshot
 
 
+MARKET_ANALYSIS_COLUMNS = {
+    "Date",
+    "Symbol",
+    "Open",
+    "High",
+    "Low",
+    "Close",
+    "Adjusted Close",
+    "Volume",
+}
+
+
 def analyze_portfolio(
     positions: pl.DataFrame,
     market_history: pl.DataFrame,
@@ -76,6 +88,84 @@ def summarize_portfolio(analysis: pl.DataFrame) -> pl.DataFrame:
             .alias("Gain/Loss %")
         )
     )
+
+
+def analyze_market_history(
+    market_history: pl.DataFrame,
+    windows: list[int],
+    price_column: str,
+) -> pl.DataFrame:
+    _require_columns(market_history, MARKET_ANALYSIS_COLUMNS, "market history")
+    windows = list(dict.fromkeys(windows))
+    if not windows or any(
+        not isinstance(window, int) or window <= 0 for window in windows
+    ):
+        raise ValueError("Analysis windows must be positive integers")
+    if price_column not in {"Close", "Adjusted Close"}:
+        raise ValueError("Price column must be Close or Adjusted Close")
+
+    analysis = market_history.sort(["Symbol", "Date"])
+    if price_column == "Adjusted Close":
+        adjustment = pl.when(pl.col("Close") != 0).then(
+            pl.col("Adjusted Close") / pl.col("Close")
+        )
+        analysis = analysis.with_columns(
+            pl.col("Adjusted Close").alias("_Analysis Price"),
+            (pl.col("High") * adjustment).alias("_Analysis High"),
+            (pl.col("Low") * adjustment).alias("_Analysis Low"),
+        )
+    else:
+        analysis = analysis.with_columns(
+            pl.col("Close").alias("_Analysis Price"),
+            pl.col("High").alias("_Analysis High"),
+            pl.col("Low").alias("_Analysis Low"),
+        )
+
+    previous_price = pl.col("_Analysis Price").shift(1).over("Symbol")
+    rolling_expressions = [
+        expression
+        for window in windows
+        for expression in (
+            pl.col("_Analysis Price")
+            .rolling_mean(window_size=window, min_samples=window)
+            .over("Symbol")
+            .alias(f"SMA {window}"),
+            pl.col("_Analysis High")
+            .rolling_max(window_size=window, min_samples=window)
+            .over("Symbol")
+            .alias(f"Rolling High {window}"),
+            pl.col("_Analysis Low")
+            .rolling_min(window_size=window, min_samples=window)
+            .over("Symbol")
+            .alias(f"Rolling Low {window}"),
+            pl.col("Volume")
+            .rolling_mean(window_size=window, min_samples=window)
+            .over("Symbol")
+            .alias(f"Volume SMA {window}"),
+        )
+    ]
+    analysis = analysis.with_columns(
+        [
+            pl.col("_Analysis Price")
+            .diff()
+            .over("Symbol")
+            .alias("Daily Change"),
+            pl.when(previous_price != 0)
+            .then((pl.col("_Analysis Price") / previous_price - 1.0) * 100.0)
+            .otherwise(None)
+            .alias("Daily Change %"),
+            *rolling_expressions,
+        ]
+    ).with_columns(
+        [
+            pl.when(pl.col(f"Volume SMA {window}") != 0)
+            .then(pl.col("Volume") / pl.col(f"Volume SMA {window}"))
+            .otherwise(None)
+            .alias(f"Relative Volume {window}")
+            for window in windows
+        ]
+    )
+    return analysis.drop("_Analysis Price", "_Analysis High", "_Analysis Low")
 
 
 def _require_columns(
