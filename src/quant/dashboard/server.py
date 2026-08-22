@@ -154,12 +154,17 @@ def health() -> dict:
 def quotes(symbols: str = Query(..., description="Comma-separated symbols")) -> dict:
     syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
     syms = syms[:20]
-    results: list[dict] = []
-    for sym in syms:
+    if not syms:
+        return {"quotes": []}
+
+    def fetch(sym: str) -> dict:
         try:
-            results.append(quote(sym))
+            return quote(sym)
         except HTTPException:
-            results.append({"symbol": sym, "error": True})
+            return {"symbol": sym, "error": True}
+
+    with ThreadPoolExecutor(max_workers=min(len(syms), 10)) as ex:
+        results = list(ex.map(fetch, syms))
     return {"quotes": results}
 
 
@@ -628,13 +633,26 @@ def holdings_list() -> dict:
     enriched = []
     total_cost = 0.0
     total_value = 0.0
+
+    # De-dup symbols so we only hit yfinance once per ticker even if the user
+    # holds it across multiple lots.
+    unique_syms = list({h["symbol"].upper() for h in raw})
+
+    def fetch_price(sym: str) -> tuple[str, float | None]:
+        try:
+            return sym, quote(sym).get("price")
+        except HTTPException:
+            return sym, None
+
+    prices: dict[str, float | None] = {}
+    if unique_syms:
+        with ThreadPoolExecutor(max_workers=min(len(unique_syms), 10)) as ex:
+            for sym, price in ex.map(fetch_price, unique_syms):
+                prices[sym] = price
+
     for h in raw:
         sym = h["symbol"].upper()
-        try:
-            q = quote(sym)
-            price = q.get("price")
-        except HTTPException:
-            price = None
+        price = prices.get(sym)
         shares = float(h["shares"])
         cost = float(h["costBasis"])
         market_value = price * shares if price is not None else None
