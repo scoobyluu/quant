@@ -49,6 +49,16 @@ uv run quant --refresh
 The default cache is `data/sp500_market_data.parquet`. Each row contains a
 trading date, symbol, company, closing price, and volume.
 
+Analyze `portfolio.csv` using cached prices first:
+
+```sh
+uv run quant portfolio
+```
+
+The portfolio CSV columns are `ticker`, `quantity`, and `cost`, where `cost` is
+the average cost per share. Symbols absent from the S&P 500 cache are downloaded
+in one batch and saved to `data/portfolio_market_data.parquet`.
+
 ## Run the dashboard
 
 ```sh
@@ -69,12 +79,7 @@ Routes:
 
 ### Holdings seeding
 
-On first run, `src/quant/dashboard/data/holdings.json` is auto-populated from `portfolio.csv` at the repo root. The CSV format is:
-
-```csv
-ticker,quantity,cost
-AAPL,23,327.82
-```
+On first run, `src/quant/dashboard/data/holdings.json` is auto-populated from `portfolio.csv` at the repo root. Only the `ticker`, `quantity`, and `cost` columns are read; extras are ignored.
 
 Edit `portfolio.csv` before the first launch, or manage holdings through the UI afterwards.
 

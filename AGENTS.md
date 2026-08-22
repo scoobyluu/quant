@@ -14,10 +14,11 @@
 - The `quant` console script resolves to `main()` in `src/quant/__init__.py`.
 - `src/quant/market_data.py` owns constituent discovery, Yahoo batching, symbol normalization (`BRK.B` -> `BRK-B`), and conversion to Polars.
 - `src/quant/storage.py` owns atomic Parquet reads/writes. Stored columns are `Date`, `Symbol`, `Company`, `Last Price`, and `Volume`.
+- `src/quant/analysis.py` contains pure Polars calculations; `src/quant/portfolio.py` owns portfolio CSV normalization and cache-first quote resolution.
 - Keep project-facing data as `polars.DataFrame`. `yfinance` returns pandas internally, but pandas must remain confined to that dependency boundary; do not add pandas imports or direct pandas dependencies.
 - Unit tests must not call Wikipedia or Yahoo. Mock the `yfinance` boundary and use temporary paths for storage tests.
 
 ## Data
 
 - `data/*.parquet` and `__pycache__/` are generated and ignored; do not commit them.
-- `portfolio.csv` is not yet consumed by application code. Treat it as user-owned input and leave it unchanged unless the task explicitly targets portfolio ingestion.
+- `portfolio.csv` uses `ticker,quantity,cost`, with `cost` interpreted as average cost per share. Treat it as user-owned input; read it but do not rewrite it.
