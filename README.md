@@ -89,3 +89,12 @@ uv run python -m pytest
 - `yfinance` is unofficial and rate-limited; expect occasional 5xx responses from Yahoo.
 - The dashboard keeps a 30s in-memory cache and serves stale data for up to 1h on upstream failure.
 - Watchlist and holdings persist to `src/quant/dashboard/data/*.json` (git-ignored).
+Analyze `portfolio.csv` using cached prices first:
+
+```sh
+uv run quant portfolio
+```
+
+The portfolio CSV columns are `ticker`, `quantity`, and `cost`, where `cost` is
+the average cost per share. Symbols absent from the S&P 500 cache are downloaded
+in one batch and saved to `data/portfolio_market_data.parquet`.
