@@ -572,6 +572,24 @@ def watchlist_get() -> dict:
     return {"symbols": _load_json(WATCHLIST_FILE, DEFAULT_WATCHLIST)}
 
 
+@app.get("/api/watchlist/quotes")
+def watchlist_quotes() -> dict:
+    """Latest quotes for every symbol in the watchlist, fetched in parallel."""
+    syms: list[str] = _load_json(WATCHLIST_FILE, DEFAULT_WATCHLIST)
+    if not syms:
+        return {"symbols": [], "quotes": []}
+
+    def fetch(sym: str) -> dict:
+        try:
+            return quote(sym)
+        except HTTPException:
+            return {"symbol": sym, "error": True}
+
+    with ThreadPoolExecutor(max_workers=min(len(syms), 10)) as ex:
+        results = list(ex.map(fetch, syms))
+    return {"symbols": syms, "quotes": results}
+
+
 @app.post("/api/watchlist")
 def watchlist_add(body: WatchlistAdd) -> dict:
     symbols: list[str] = _load_json(WATCHLIST_FILE, DEFAULT_WATCHLIST)
