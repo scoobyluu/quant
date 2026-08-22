@@ -1,4 +1,5 @@
 import unittest
+from datetime import date
 from unittest.mock import patch
 
 from quant.market_data import get_latest_market_data
@@ -9,13 +10,12 @@ class FakeSeries:
         self.value = value
         self.index = [date]
         self.empty = False
-        self.iloc = self
 
     def dropna(self):
         return self
 
-    def __getitem__(self, index):
-        return self.value
+    def items(self):
+        return [(self.index[0], self.value)]
 
 
 class FakeColumns:
@@ -36,10 +36,14 @@ class FakeHistory:
     empty = False
 
     def __init__(self) -> None:
-        date = "2026-08-21"
+        trading_date = date(2026, 8, 21)
         self.columns = {
-            "Close": FakeColumns({"BRK-B": 500.25, "AAPL": 225.50}, date),
-            "Volume": FakeColumns({"BRK-B": 1_000_000, "AAPL": 2_000_000}, date),
+            "Close": FakeColumns(
+                {"BRK-B": 500.25, "AAPL": 225.50}, trading_date
+            ),
+            "Volume": FakeColumns(
+                {"BRK-B": 1_000_000, "AAPL": 2_000_000}, trading_date
+            ),
         }
 
     def __getitem__(self, column):
