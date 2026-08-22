@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Quant Dashboard</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="icon" href="data:," />
+  </head>
+  <body>
+    <header>
+      <div class="container nav">
+        <a href="#/" class="brand">Quant Dashboard</a>
+        <nav>
+          <a href="#/">Watchlist</a>
+          <a href="#/holdings">Holdings</a>
+        </nav>
+      </div>
+      <div id="market-strip" class="market-strip"></div>
+    </header>
+    <main id="app" class="container"></main>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>
