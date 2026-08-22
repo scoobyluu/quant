@@ -25,8 +25,6 @@ def analyze_portfolio(
         {"Date", "Symbol", "Last Price"},
         "market history",
     )
-    if positions.get_column("Symbol").n_unique() != positions.height:
-        raise ValueError("Portfolio positions must contain one row per symbol")
     if positions.filter(
         (pl.col("Quantity") <= 0)
         | (pl.col("Average Cost") < 0)
@@ -40,7 +38,7 @@ def analyze_portfolio(
         pl.col("Date").alias("As Of"),
         "Last Price",
     )
-    analysis = positions.join(quotes, on="Symbol", how="left", validate="1:1")
+    analysis = positions.join(quotes, on="Symbol", how="left", validate="m:1")
     missing = analysis.filter(pl.col("Last Price").is_null()).get_column("Symbol")
     if not missing.is_empty():
         raise ValueError(f"Missing market data for: {', '.join(missing.to_list())}")
@@ -87,6 +85,35 @@ def summarize_portfolio(analysis: pl.DataFrame) -> pl.DataFrame:
             .otherwise(None)
             .alias("Gain/Loss %")
         )
+    )
+
+
+def summarize_allocation(
+    analysis: pl.DataFrame,
+    dimension: str,
+) -> pl.DataFrame:
+    _require_columns(
+        analysis,
+        {dimension, "Cost Basis", "Market Value", "Gain/Loss"},
+        "portfolio analysis",
+    )
+    total_value = analysis.get_column("Market Value").sum()
+    if total_value is None or total_value <= 0:
+        raise ValueError("Portfolio market value must be positive")
+    return (
+        analysis.with_columns(
+            pl.col(dimension).cast(pl.String).fill_null("Unspecified")
+        )
+        .group_by(dimension)
+        .agg(
+            pl.col("Cost Basis").sum(),
+            pl.col("Market Value").sum(),
+            pl.col("Gain/Loss").sum(),
+        )
+        .with_columns(
+            (pl.col("Market Value") / total_value * 100.0).alias("Weight %")
+        )
+        .sort("Weight %", descending=True)
     )
 
 

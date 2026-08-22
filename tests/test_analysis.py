@@ -4,7 +4,12 @@ from datetime import date
 import polars as pl
 from polars.testing import assert_frame_equal
 
-from quant.analysis import analyze_market_history, analyze_portfolio, summarize_portfolio
+from quant.analysis import (
+    analyze_market_history,
+    analyze_portfolio,
+    summarize_allocation,
+    summarize_portfolio,
+)
 
 
 class PortfolioAnalysisTests(unittest.TestCase):
@@ -58,6 +63,22 @@ class PortfolioAnalysisTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "Missing market data for: AAA"):
             analyze_portfolio(positions, market_history)
+
+    def test_summarizes_allocation_by_portfolio_dimension(self) -> None:
+        analysis = pl.DataFrame(
+            {
+                "Account": ["taxable", "roth", "taxable"],
+                "Cost Basis": [80.0, 50.0, 20.0],
+                "Market Value": [100.0, 60.0, 40.0],
+                "Gain/Loss": [20.0, 10.0, 20.0],
+            }
+        )
+
+        result = summarize_allocation(analysis, "Account")
+
+        self.assertEqual(result.get_column("Account").to_list(), ["taxable", "roth"])
+        self.assertEqual(result.get_column("Market Value").to_list(), [140.0, 60.0])
+        self.assertEqual(result.get_column("Weight %").to_list(), [70.0, 30.0])
 
 
 class MarketAnalysisTests(unittest.TestCase):

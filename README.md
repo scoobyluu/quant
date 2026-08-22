@@ -44,9 +44,12 @@ Analyze the full cached S&P 500:
 uv run quant market --index --windows 5 20 --price adjusted
 ```
 
+Market analysis calculates daily price changes, moving averages, rolling
+highs/lows, volume averages, and relative volume.
+
 The portfolio CSV requires `ticker`, `quantity`, and `cost`, where `cost` is the
-average cost per share. Additional portfolio metadata columns are preserved as
-import data for the dashboard.
+average cost per share. Optional `account`, `asset_class`, `sector`, and
+`acquired` columns are accepted during import.
 
 ## Dashboard
 
@@ -68,15 +71,20 @@ Routes:
 - `/api/*` provides JSON APIs.
 - `/docs` provides generated API documentation.
 
-The dashboard currently includes a watchlist, holdings, stock history,
-fundamentals, analyst ratings, earnings, options, and news.
+The dashboard includes a watchlist, holdings, stock history, fundamentals,
+analyst ratings, earnings, options, and news.
+
+On first use, `portfolio.csv` is imported into `data/quant.db`. The dashboard
+then treats SQLite as the source of truth for position lots and watchlists; the
+CSV remains an import/export format.
 
 ## Storage
 
 - `data/sp500_market_data.parquet` stores cached index bars.
 - `data/portfolio_market_data.parquet` stores supplemental portfolio quotes.
 - `data/market_analysis.parquet` stores full bars used by market analysis.
-- `portfolio.csv` is the current import format for portfolio positions.
+- `data/quant.db` stores app-managed position lots and watchlists.
+- `portfolio.csv` is the import format for portfolio positions.
 
 ## Tests
 
