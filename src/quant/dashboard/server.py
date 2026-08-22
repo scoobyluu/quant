@@ -5,6 +5,7 @@ import json
 import math
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,7 @@ DEFAULT_WATCHLIST = ["AAPL", "MSFT", "NVDA", "GOOGL", "TSLA"]
 
 _cache: dict[str, tuple[float, Any]] = {}
 CACHE_TTL_SECONDS = 30
+NEWS_TTL_SECONDS = 60 * 5  # news changes slower than quotes; cache longer
 STALE_TTL_SECONDS = 60 * 60
 
 
@@ -92,15 +94,15 @@ if not HOLDINGS_FILE.exists():
     _seed_holdings_from_csv()
 
 
-def _cached(key: str, producer):
-    """Return fresh value if cached < TTL; otherwise call producer.
+def _cached(key: str, producer, ttl: int = CACHE_TTL_SECONDS):
+    """Return fresh value if cached < ttl; otherwise call producer.
 
     On producer failure, fall back to a stale cached value (<= STALE_TTL) so a
     transient upstream 429 doesn't blank the UI.
     """
     now = time.time()
     hit = _cache.get(key)
-    if hit and now - hit[0] < CACHE_TTL_SECONDS:
+    if hit and now - hit[0] < ttl:
         return hit[1]
     try:
         value = producer()
@@ -475,7 +477,7 @@ def news(symbol: str) -> dict:
         return _clean({"symbol": symbol.upper(), "items": normalized})
 
     try:
-        return _cached(f"news:{symbol.upper()}", produce)
+        return _cached(f"news:{symbol.upper()}", produce, ttl=NEWS_TTL_SECONDS)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"yfinance error: {e}")
 
@@ -490,20 +492,24 @@ def news_feed(symbols: str | None = Query(None, description="Comma-separated sym
     syms = syms[:10]
 
     def produce() -> dict:
+        def fetch(sym: str) -> tuple[str, list[dict]]:
+            try:
+                return sym, (news(sym).get("items") or [])
+            except HTTPException:
+                return sym, []
+
         merged: list[dict] = []
         seen: set[str] = set()
-        for sym in syms:
-            try:
-                payload = news(sym)
-                items = payload.get("items") or []
-            except HTTPException:
-                items = []
-            for it in items:
-                key = it.get("link") or it.get("title")
-                if not key or key in seen:
-                    continue
-                seen.add(key)
-                merged.append({**it, "symbol": sym})
+        if syms:
+            with ThreadPoolExecutor(max_workers=min(len(syms), 10)) as ex:
+                # ex.map preserves input order, giving stable de-dup priority.
+                for sym, items in ex.map(fetch, syms):
+                    for it in items:
+                        key = it.get("link") or it.get("title")
+                        if not key or key in seen:
+                            continue
+                        seen.add(key)
+                        merged.append({**it, "symbol": sym})
 
         def sort_key(item: dict):
             v = item.get("publishedAt")
@@ -523,7 +529,7 @@ def news_feed(symbols: str | None = Query(None, description="Comma-separated sym
 
     key = "feed:" + ",".join(syms)
     try:
-        return _cached(key, produce)
+        return _cached(key, produce, ttl=NEWS_TTL_SECONDS)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"yfinance error: {e}")
 
@@ -564,6 +570,24 @@ class WatchlistAdd(BaseModel):
 @app.get("/api/watchlist")
 def watchlist_get() -> dict:
     return {"symbols": _load_json(WATCHLIST_FILE, DEFAULT_WATCHLIST)}
+
+
+@app.get("/api/watchlist/quotes")
+def watchlist_quotes() -> dict:
+    """Latest quotes for every symbol in the watchlist, fetched in parallel."""
+    syms: list[str] = _load_json(WATCHLIST_FILE, DEFAULT_WATCHLIST)
+    if not syms:
+        return {"symbols": [], "quotes": []}
+
+    def fetch(sym: str) -> dict:
+        try:
+            return quote(sym)
+        except HTTPException:
+            return {"symbol": sym, "error": True}
+
+    with ThreadPoolExecutor(max_workers=min(len(syms), 10)) as ex:
+        results = list(ex.map(fetch, syms))
+    return {"symbols": syms, "quotes": results}
 
 
 @app.post("/api/watchlist")
