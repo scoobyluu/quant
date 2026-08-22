@@ -1,6 +1,7 @@
 # Quant
 
-Market data is represented and processed with Polars. Ships two entry points:
+Market data is represented and processed with Polars, then cached locally as
+Parquet for analysis and repeatable testing. Ships two entry points:
 
 - `quant` — CLI that prints the latest price and volume for every S&P 500 constituent.
 - `quant-dashboard` — FastAPI + vanilla-JS SPA with a watchlist, holdings, and per-stock detail (price history, fundamentals, analyst ratings, earnings, options, news).
@@ -32,11 +33,21 @@ This creates a `.venv/` and installs all dependencies from `uv.lock`.
 
 ## Run the CLI
 
-Fetch and print the latest price and volume for every S&P 500 constituent:
+Use the local cache, downloading the latest five trading sessions if it does not
+exist:
 
 ```sh
 uv run quant
 ```
+
+Refresh the cache from Yahoo Finance:
+
+```sh
+uv run quant --refresh
+```
+
+The default cache is `data/sp500_market_data.parquet`. Each row contains a
+trading date, symbol, company, closing price, and volume.
 
 ## Run the dashboard
 

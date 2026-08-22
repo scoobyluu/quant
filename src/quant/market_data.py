@@ -40,11 +40,12 @@ def get_sp500_constituents() -> pl.DataFrame:
     )
 
 
-def get_latest_market_data(symbols: Iterable[str]) -> pl.DataFrame:
+def get_market_history(symbols: Iterable[str]) -> pl.DataFrame:
     symbols = list(dict.fromkeys(symbols))
     if not symbols:
         return pl.DataFrame(
             schema={
+                "Date": pl.Date,
                 "Symbol": pl.String,
                 "Last Price": pl.Float64,
                 "Volume": pl.Int64,
@@ -70,46 +71,75 @@ def get_latest_market_data(symbols: Iterable[str]) -> pl.DataFrame:
     rows = []
     for yahoo_symbol, index_symbol in yahoo_to_index_symbol.items():
         if yahoo_symbol not in closes.columns:
-            rows.append({"Symbol": index_symbol, "Last Price": None, "Volume": None})
             continue
 
         prices = closes[yahoo_symbol].dropna()
-        if prices.empty:
-            rows.append({"Symbol": index_symbol, "Last Price": None, "Volume": None})
-            continue
-
-        latest_date = prices.index[-1]
-        volume = volumes.at[latest_date, yahoo_symbol]
-        rows.append(
-            {
-                "Symbol": index_symbol,
-                "Last Price": float(prices.iloc[-1]),
-                "Volume": (
-                    None
-                    if volume is None or math.isnan(float(volume))
-                    else int(volume)
-                ),
-            }
-        )
+        for date, price in prices.items():
+            volume = volumes.at[date, yahoo_symbol]
+            rows.append(
+                {
+                    "Date": date.date() if hasattr(date, "date") else date,
+                    "Symbol": index_symbol,
+                    "Last Price": float(price),
+                    "Volume": (
+                        None
+                        if volume is None or math.isnan(float(volume))
+                        else int(volume)
+                    ),
+                }
+            )
 
     return pl.DataFrame(
         rows,
         schema={
+            "Date": pl.Date,
             "Symbol": pl.String,
             "Last Price": pl.Float64,
             "Volume": pl.Int64,
         },
+    ).sort(["Date", "Symbol"])
+
+
+def get_latest_market_data(symbols: Iterable[str]) -> pl.DataFrame:
+    symbols = list(dict.fromkeys(symbols))
+    if not symbols:
+        return pl.DataFrame(
+            schema={
+                "Symbol": pl.String,
+                "Last Price": pl.Float64,
+                "Volume": pl.Int64,
+            }
+        )
+
+    history = get_market_history(symbols)
+    latest = (
+        history.sort("Date")
+        .group_by("Symbol", maintain_order=True)
+        .last()
+        .drop("Date")
+    )
+    return pl.DataFrame({"Symbol": symbols}).join(latest, on="Symbol", how="left")
+
+
+def latest_market_snapshot(history: pl.DataFrame) -> pl.DataFrame:
+    return (
+        history.sort(["Symbol", "Date"])
+        .group_by("Symbol", maintain_order=True)
+        .last()
+        .select(history.columns)
     )
 
 
 def get_sp500_market_data() -> pl.DataFrame:
+    return latest_market_snapshot(get_sp500_market_history())
+
+
+def get_sp500_market_history() -> pl.DataFrame:
     constituents = get_sp500_constituents()
-    market_data = get_latest_market_data(
-        constituents.get_column("Symbol").to_list()
-    )
+    history = get_market_history(constituents.get_column("Symbol").to_list())
     return constituents.join(
-        market_data,
+        history,
         on="Symbol",
         how="left",
-        validate="1:1",
-    )
+        validate="1:m",
+    ).select("Date", "Symbol", "Company", "Last Price", "Volume")
