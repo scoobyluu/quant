@@ -48,6 +48,9 @@ CACHE_TTL_SECONDS = 30
 NEWS_TTL_SECONDS = 60 * 5  # news changes slower than quotes; cache longer
 NAME_TTL_SECONDS = 60 * 60 * 24  # company names effectively never change
 STALE_TTL_SECONDS = 60 * 60
+ANALYTICS_TTL_SECONDS = 60 * 15  # returns-based analytics are heavy; refresh every 15m
+TRADING_DAYS = 252
+BENCHMARK_SYMBOL = "SPY"
 
 
 def _load_json(path: Path, default: Any) -> Any:
@@ -622,6 +625,193 @@ def search(q: str = Query(..., min_length=1)) -> dict:
         raise HTTPException(status_code=502, detail=f"yfinance error: {e}")
 
 
+# ---- Analytics ----
+
+
+def _daily_closes(symbol: str, period: str = "1y") -> list[tuple[str, float]]:
+    """Return [(iso_date, adjusted_close)] daily bars for `symbol`.
+
+    Uses auto-adjusted closes so returns reflect splits/dividends.
+    """
+    def produce() -> list[tuple[str, float]]:
+        df = _ticker(symbol).history(period=period, interval="1d", auto_adjust=True)
+        if df.empty:
+            return []
+        df = df.reset_index()
+        date_col = "Datetime" if "Datetime" in df.columns else "Date"
+        out: list[tuple[str, float]] = []
+        for _, row in df.iterrows():
+            close = row.get("Close")
+            if close is None:
+                continue
+            try:
+                c = float(close)
+            except (TypeError, ValueError):
+                continue
+            if math.isnan(c) or math.isinf(c):
+                continue
+            d = row[date_col]
+            iso = d.date().isoformat() if hasattr(d, "date") else str(d)[:10]
+            out.append((iso, c))
+        return out
+
+    return _cached(f"closes:{symbol.upper()}:{period}", produce, ttl=ANALYTICS_TTL_SECONDS)
+
+
+def _stats_from_returns(returns: list[float]) -> dict:
+    """Sharpe, Sortino, annualized vol, max drawdown, cumulative return.
+
+    Sharpe/Sortino here are excess-over-zero — no risk-free adjustment. That's
+    a common simplification for a dashboard view.
+    """
+    if not returns:
+        return {
+            "sharpe": None,
+            "sortino": None,
+            "volatility": None,
+            "maxDrawdown": None,
+            "cumulativeReturn": None,
+        }
+    n = len(returns)
+    mean = sum(returns) / n
+    var = sum((r - mean) ** 2 for r in returns) / n if n > 1 else 0.0
+    std = math.sqrt(var)
+    downside = [r for r in returns if r < 0]
+    dvar = sum(r * r for r in downside) / n if downside else 0.0
+    dstd = math.sqrt(dvar)
+    ann_ret = mean * TRADING_DAYS
+    ann_vol = std * math.sqrt(TRADING_DAYS)
+    ann_dvol = dstd * math.sqrt(TRADING_DAYS)
+
+    cum = 1.0
+    peak = 1.0
+    max_dd = 0.0
+    for r in returns:
+        cum *= 1.0 + r
+        if cum > peak:
+            peak = cum
+        dd = cum / peak - 1.0
+        if dd < max_dd:
+            max_dd = dd
+
+    return {
+        "sharpe": (ann_ret / ann_vol) if ann_vol else None,
+        "sortino": (ann_ret / ann_dvol) if ann_dvol else None,
+        "volatility": ann_vol,
+        "maxDrawdown": max_dd,
+        "cumulativeReturn": cum - 1.0,
+    }
+
+
+def _beta_alpha(
+    port_by_date: dict[str, float], bench_by_date: dict[str, float]
+) -> tuple[float | None, float | None]:
+    """Beta = cov(p,m)/var(m); alpha = annualized daily intercept."""
+    dates = sorted(set(port_by_date) & set(bench_by_date))
+    if len(dates) < 2:
+        return None, None
+    p = [port_by_date[d] for d in dates]
+    m = [bench_by_date[d] for d in dates]
+    n = len(dates)
+    pm = sum(p) / n
+    mm = sum(m) / n
+    cov = sum((p[i] - pm) * (m[i] - mm) for i in range(n)) / n
+    var_m = sum((m[i] - mm) ** 2 for i in range(n)) / n
+    if not var_m:
+        return None, None
+    beta = cov / var_m
+    alpha_daily = pm - beta * mm
+    return beta, alpha_daily * TRADING_DAYS
+
+
+def _returns_by_date(closes: list[tuple[str, float]]) -> dict[str, float]:
+    """Simple daily returns keyed by trailing date."""
+    out: dict[str, float] = {}
+    for i in range(1, len(closes)):
+        prev = closes[i - 1][1]
+        if prev:
+            out[closes[i][0]] = closes[i][1] / prev - 1.0
+    return out
+
+
+def _portfolio_value_series(
+    holdings: list[dict], histories: dict[str, list[tuple[str, float]]]
+) -> dict[str, float]:
+    """Daily portfolio market value assuming current shares held throughout."""
+    if not holdings:
+        return {}
+    # Union of dates, then forward-fill each symbol's close so a missing day
+    # (rare — halts, holidays) doesn't drop the whole portfolio row.
+    all_dates: set[str] = set()
+    for series in histories.values():
+        for date, _ in series:
+            all_dates.add(date)
+    dates = sorted(all_dates)
+    if not dates:
+        return {}
+
+    filled: dict[str, dict[str, float]] = {}
+    for sym, series in histories.items():
+        d2c = dict(series)
+        last: float | None = None
+        col: dict[str, float] = {}
+        for date in dates:
+            if date in d2c:
+                last = d2c[date]
+            if last is not None:
+                col[date] = last
+        filled[sym] = col
+
+    out: dict[str, float] = {}
+    for date in dates:
+        v = 0.0
+        ok = True
+        for h in holdings:
+            sym = h["symbol"].upper()
+            close = filled.get(sym, {}).get(date)
+            if close is None:
+                ok = False
+                break
+            v += float(h["shares"]) * close
+        if ok:
+            out[date] = v
+    return out
+
+
+def _range_return(closes: list[tuple[str, float]], start_iso: str | None) -> float | None:
+    """Percent change from the first close on/after start_iso to the latest close."""
+    if not closes:
+        return None
+    if start_iso is None:
+        first = closes[0][1]
+    else:
+        first = None
+        for date, c in closes:
+            if date >= start_iso:
+                first = c
+                break
+    if not first:
+        return None
+    last = closes[-1][1]
+    return last / first - 1.0
+
+
+def _month_ago_iso(latest_iso: str) -> str:
+    """Rough one-month lookback: 30 days back from the latest bar."""
+    from datetime import date, timedelta
+
+    try:
+        y, m, d = (int(x) for x in latest_iso.split("-"))
+        return (date(y, m, d) - timedelta(days=30)).isoformat()
+    except Exception:
+        return latest_iso
+
+
+def _ytd_start_iso(latest_iso: str) -> str:
+    """Jan 1 of the year of the latest bar (returned as ISO date)."""
+    return f"{latest_iso[:4]}-01-01"
+
+
 # ---- Watchlist ----
 
 
@@ -650,6 +840,38 @@ def watchlist_quotes() -> dict:
     with ThreadPoolExecutor(max_workers=min(len(syms), 10)) as ex:
         results = list(ex.map(fetch, syms))
     return {"symbols": syms, "quotes": results}
+
+
+@app.get("/api/watchlist/analytics")
+def watchlist_analytics() -> dict:
+    """Per-symbol 1M return, YTD return, 1Y Sharpe and 1Y annualized vol."""
+    syms: list[str] = _load_json(WATCHLIST_FILE, DEFAULT_WATCHLIST)
+    if not syms:
+        return {"symbols": [], "metrics": []}
+
+    def compute(sym: str) -> dict:
+        try:
+            closes = _daily_closes(sym, "1y")
+        except Exception:
+            return {"symbol": sym, "error": True}
+        if len(closes) < 2:
+            return {"symbol": sym}
+        latest = closes[-1][0]
+        one_month = _range_return(closes, _month_ago_iso(latest))
+        ytd = _range_return(closes, _ytd_start_iso(latest))
+        returns = list(_returns_by_date(closes).values())
+        stats = _stats_from_returns(returns)
+        return {
+            "symbol": sym,
+            "oneMonth": one_month,
+            "ytd": ytd,
+            "sharpe": stats["sharpe"],
+            "volatility": stats["volatility"],
+        }
+
+    with ThreadPoolExecutor(max_workers=min(len(syms), 10)) as ex:
+        metrics = list(ex.map(compute, syms))
+    return _clean({"symbols": syms, "metrics": metrics})
 
 
 @app.post("/api/watchlist")
@@ -743,6 +965,93 @@ def holdings_list() -> dict:
                 "gain": total_gain,
                 "gainPercent": total_gain_pct,
             },
+        }
+    )
+
+
+@app.get("/api/portfolio/analytics")
+def portfolio_analytics(period: str = Query("1y", description="1mo,3mo,6mo,1y,2y,5y,10y,ytd,max")) -> dict:
+    """Risk-adjusted return metrics + cumulative-return curve vs SPY.
+
+    Assumes the user's current shares were held throughout `period` — a
+    standard backtest simplification, not an accurate historical P&L.
+    """
+    raw: list[dict] = _load_json(HOLDINGS_FILE, [])
+    if not raw:
+        return {
+            "period": period,
+            "benchmark": BENCHMARK_SYMBOL,
+            "kpis": {},
+            "curve": [],
+        }
+
+    unique_syms = list({h["symbol"].upper() for h in raw})
+    fetch_syms = unique_syms + [BENCHMARK_SYMBOL]
+
+    def fetch(sym: str) -> tuple[str, list[tuple[str, float]]]:
+        try:
+            return sym, _daily_closes(sym, period)
+        except Exception:
+            return sym, []
+
+    histories: dict[str, list[tuple[str, float]]] = {}
+    with ThreadPoolExecutor(max_workers=min(len(fetch_syms), 10)) as ex:
+        for sym, series in ex.map(fetch, fetch_syms):
+            histories[sym] = series
+
+    bench_series = histories.pop(BENCHMARK_SYMBOL, [])
+    port_value = _portfolio_value_series(raw, histories)
+    if not port_value or not bench_series:
+        return {
+            "period": period,
+            "benchmark": BENCHMARK_SYMBOL,
+            "kpis": {},
+            "curve": [],
+        }
+
+    dates = sorted(port_value.keys())
+    values = [port_value[d] for d in dates]
+    port_returns_seq = [values[i] / values[i - 1] - 1.0 for i in range(1, len(values)) if values[i - 1]]
+    port_returns_by_date = {dates[i]: values[i] / values[i - 1] - 1.0 for i in range(1, len(values)) if values[i - 1]}
+
+    bench_returns_by_date = _returns_by_date(bench_series)
+    bench_by_date_close = dict(bench_series)
+
+    port_stats = _stats_from_returns(port_returns_seq)
+    beta, alpha = _beta_alpha(port_returns_by_date, bench_returns_by_date)
+
+    # Cumulative return curve, aligned on the intersection of portfolio and
+    # benchmark dates so the two series start at 0 on the same day.
+    common = sorted(set(dates) & set(bench_by_date_close.keys()))
+    curve: list[dict] = []
+    if len(common) >= 2:
+        p0 = port_value[common[0]]
+        b0 = bench_by_date_close[common[0]]
+        if p0 and b0:
+            for d in common:
+                curve.append(
+                    {
+                        "t": d,
+                        "portfolio": port_value[d] / p0 - 1.0,
+                        "benchmark": bench_by_date_close[d] / b0 - 1.0,
+                    }
+                )
+
+    bench_return = (bench_series[-1][1] / bench_series[0][1] - 1.0) if bench_series and bench_series[0][1] else None
+
+    kpis = {
+        **port_stats,
+        "beta": beta,
+        "alpha": alpha,
+        "benchmarkReturn": bench_return,
+    }
+
+    return _clean(
+        {
+            "period": period,
+            "benchmark": BENCHMARK_SYMBOL,
+            "kpis": kpis,
+            "curve": curve,
         }
     )
 

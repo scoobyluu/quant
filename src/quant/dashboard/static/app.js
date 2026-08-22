@@ -30,6 +30,9 @@ const api = {
     j(`/api/holdings`, "POST", { symbol, shares, costBasis }),
   holdingRemove: (id) => j(`/api/holdings/${encodeURIComponent(id)}`, "DELETE"),
   quotes: (symbols) => j(`/api/quotes?symbols=${encodeURIComponent(symbols.join(","))}`),
+  portfolioAnalytics: (period = "1y") =>
+    j(`/api/portfolio/analytics?period=${encodeURIComponent(period)}`),
+  watchlistAnalytics: () => j(`/api/watchlist/analytics`),
 };
 
 async function j(path, method = "GET", body) {
@@ -180,6 +183,9 @@ async function renderWatchlist() {
           h("th", {}, "Change"),
           h("th", {}, "Change %"),
           h("th", {}, "Volume"),
+          h("th", {}, "1M"),
+          h("th", {}, "YTD"),
+          h("th", {}, "Sharpe"),
           h("th", {})
         )
       ),
@@ -193,7 +199,7 @@ async function renderWatchlist() {
           {},
           h(
             "td",
-            { colspan: 7, class: "muted", style: { textAlign: "center", padding: "24px" } },
+            { colspan: 10, class: "muted", style: { textAlign: "center", padding: "24px" } },
             "Watchlist is empty. Add a ticker above."
           )
         )
@@ -209,6 +215,9 @@ async function renderWatchlist() {
           h("td", { id: `wchg-${sym}` }, "…"),
           h("td", { id: `wpct-${sym}` }, "…"),
           h("td", { class: "muted", id: `wvol-${sym}` }, "…"),
+          h("td", { class: "muted", id: `w1m-${sym}` }, "…"),
+          h("td", { class: "muted", id: `wytd-${sym}` }, "…"),
+          h("td", { class: "muted", id: `wsharpe-${sym}` }, "…"),
           h(
             "td",
             { class: "right" },
@@ -221,7 +230,39 @@ async function renderWatchlist() {
     panel.replaceChildren(tbl);
     if (symbols.length) {
       for (const q of quotes) fillRow(q);
+      loadAnalytics();
     }
+  }
+
+  async function loadAnalytics() {
+    try {
+      const { metrics } = await api.watchlistAnalytics();
+      for (const m of metrics || []) fillAnalytics(m);
+    } catch {}
+  }
+
+  function fillAnalytics(m) {
+    if (!m || !m.symbol) return;
+    const sym = m.symbol;
+    setPctCell(`w1m-${sym}`, m.oneMonth);
+    setPctCell(`wytd-${sym}`, m.ytd);
+    const sh = document.getElementById(`wsharpe-${sym}`);
+    if (sh) {
+      sh.textContent = typeof m.sharpe === "number" ? fmtNum(m.sharpe, 2) : "—";
+      sh.className = typeof m.sharpe === "number" && m.sharpe >= 0 ? "up" : "muted";
+    }
+  }
+
+  function setPctCell(id, v) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (typeof v !== "number") {
+      el.textContent = "—";
+      el.className = "muted";
+      return;
+    }
+    el.textContent = fmtPct(v * 100);
+    el.className = v >= 0 ? "up" : "down";
   }
 
   function fillRow(q) {
@@ -1231,9 +1272,12 @@ async function renderHoldings() {
     h("div", { class: "muted small" }, "Track cost basis vs. live market value.")
   );
   const totalsSlot = h("div");
+  const analyticsSlot = h("div");
+  const chartSlot = h("div");
   const form = h("div");
   const tableSlot = h("div", { class: "panel", style: { padding: 0, overflow: "hidden" } });
-  root.append(head, totalsSlot, form, tableSlot);
+  root.append(head, totalsSlot, analyticsSlot, chartSlot, form, tableSlot);
+  let analyticsChart = null;
 
   function mountForm() {
     const symInput = h("input", {
@@ -1459,8 +1503,144 @@ async function renderHoldings() {
     );
   }
 
+  async function loadAnalytics() {
+    try {
+      const a = await api.portfolioAnalytics("1y");
+      analyticsSlot.replaceChildren(renderPortfolioKpis(a));
+      chartSlot.replaceChildren(renderPortfolioCurve(a, (chart) => (analyticsChart = chart)));
+    } catch (e) {
+      analyticsSlot.replaceChildren(
+        h("div", { class: "panel error" }, `Analytics unavailable: ${e.message}`)
+      );
+      chartSlot.replaceChildren();
+    }
+  }
+
   await draw();
+  loadAnalytics();
   holdingsTimer = setInterval(draw, 30000);
+}
+
+function renderPortfolioKpis(a) {
+  const k = a.kpis || {};
+  if (k.sharpe == null && k.volatility == null && k.beta == null) {
+    return h(
+      "div",
+      { class: "panel muted small" },
+      "Analytics unavailable — add holdings and enough history to compute."
+    );
+  }
+  function num(v, d = 2) {
+    return typeof v === "number" ? fmtNum(v, d) : "—";
+  }
+  function pct(v) {
+    return typeof v === "number" ? fmtPct(v * 100) : "—";
+  }
+  const cumUp = (k.cumulativeReturn ?? 0) >= 0;
+  const bench = a.benchmark || "SPY";
+  return h(
+    "div",
+    { class: "grid cols-4" },
+    kpiCard(`Return (${a.period || "1y"})`, pct(k.cumulativeReturn), cumUp ? "up" : "down"),
+    kpiCard(`${bench} return`, pct(k.benchmarkReturn), (k.benchmarkReturn ?? 0) >= 0 ? "up" : "down"),
+    kpiCard("Sharpe", num(k.sharpe)),
+    kpiCard("Sortino", num(k.sortino)),
+    kpiCard("Volatility", pct(k.volatility)),
+    kpiCard("Max drawdown", pct(k.maxDrawdown), "down"),
+    kpiCard(`Beta vs ${bench}`, num(k.beta)),
+    kpiCard("Alpha (ann.)", pct(k.alpha), (k.alpha ?? 0) >= 0 ? "up" : "down")
+  );
+}
+
+function kpiCard(label, value, cls = "") {
+  return h(
+    "div",
+    { class: "panel" },
+    h("div", { class: "muted small" }, label),
+    h("div", { class: cls, style: { fontSize: "18px", fontWeight: "600" } }, value)
+  );
+}
+
+function renderPortfolioCurve(a, onChart) {
+  const points = a.curve || [];
+  const bench = a.benchmark || "SPY";
+  const panel = h(
+    "div",
+    { class: "panel stack" },
+    h("h2", {}, `Cumulative return vs ${bench}`),
+    h("div", { class: "muted small" }, `Assumes current shares held throughout ${a.period || "1y"}.`)
+  );
+  if (points.length < 2) {
+    panel.append(h("div", { class: "muted" }, "Not enough history to plot."));
+    return panel;
+  }
+  const wrap = h("div", { class: "chart-wrap" }, h("canvas"));
+  panel.append(wrap);
+  // Defer chart construction to next tick so the canvas is in the DOM.
+  setTimeout(() => {
+    const canvas = wrap.querySelector("canvas");
+    if (!canvas) return;
+    const port = points.map((p) => ({ x: p.t, y: (p.portfolio ?? 0) * 100 }));
+    const spy = points.map((p) => ({ x: p.t, y: (p.benchmark ?? 0) * 100 }));
+    const ctx = canvas.getContext("2d");
+    const chart = new Chart(ctx, {
+      type: "line",
+      data: {
+        datasets: [
+          {
+            label: "Portfolio",
+            data: port,
+            borderColor: "#4f8cff",
+            backgroundColor: "#4f8cff22",
+            borderWidth: 2,
+            pointRadius: 0,
+            fill: false,
+            tension: 0.1,
+          },
+          {
+            label: bench,
+            data: spy,
+            borderColor: "#8a93a6",
+            borderWidth: 1.25,
+            pointRadius: 0,
+            fill: false,
+            tension: 0.1,
+            borderDash: [4, 4],
+          },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: "index", intersect: false },
+        plugins: {
+          legend: {
+            display: true,
+            position: "top",
+            align: "end",
+            labels: { color: "#8a93a6", boxWidth: 12, boxHeight: 2 },
+          },
+          tooltip: {
+            callbacks: { label: (c) => `${c.dataset.label}: ${fmtPct(c.parsed.y)}` },
+          },
+        },
+        scales: {
+          x: {
+            type: "time",
+            time: { tooltipFormat: "PP" },
+            ticks: { color: "#8a93a6" },
+            grid: { color: "#1f2530" },
+          },
+          y: {
+            ticks: { color: "#8a93a6", callback: (v) => `${v.toFixed(0)}%` },
+            grid: { color: "#1f2530" },
+          },
+        },
+      },
+    });
+    if (typeof onChart === "function") onChart(chart);
+  }, 0);
+  return panel;
 }
 
 // ---------- router ----------
