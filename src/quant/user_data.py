@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 
-from quant.portfolio import DEFAULT_PORTFOLIO_PATH, load_portfolio_lots
-
+import polars as pl
 
 DEFAULT_USER_DATA_PATH = Path("data/quant.db")
 DEFAULT_WATCHLIST = ["AAPL", "MSFT", "NVDA", "GOOGL", "TSLA"]
@@ -16,7 +17,7 @@ class UserDataRepository:
     def __init__(self, path: Path = DEFAULT_USER_DATA_PATH) -> None:
         self.path = path
 
-    def initialize(self, portfolio_path: Path = DEFAULT_PORTFOLIO_PATH) -> None:
+    def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             connection.executescript(
@@ -47,10 +48,6 @@ class UserDataRepository:
                     [(symbol, index) for index, symbol in enumerate(DEFAULT_WATCHLIST)],
                 )
                 self._mark_seeded(connection, "watchlist")
-            if not self._is_seeded(connection, "portfolio"):
-                if portfolio_path.exists():
-                    self._import_portfolio(connection, portfolio_path)
-                self._mark_seeded(connection, "portfolio")
 
     def list_positions(self) -> list[dict]:
         self.initialize()
@@ -64,6 +61,31 @@ class UserDataRepository:
                 """
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def positions_frame(self) -> pl.DataFrame:
+        positions = self.list_positions()
+        return pl.DataFrame(
+            {
+                "ID": [position["id"] for position in positions],
+                "Symbol": [position["symbol"] for position in positions],
+                "Quantity": [position["quantity"] for position in positions],
+                "Average Cost": [position["average_cost"] for position in positions],
+                "Account": [position["account"] for position in positions],
+                "Asset Class": [position["asset_class"] for position in positions],
+                "Sector": [position["sector"] for position in positions],
+                "Acquired": [position["acquired"] for position in positions],
+            },
+            schema={
+                "ID": pl.String,
+                "Symbol": pl.String,
+                "Quantity": pl.Float64,
+                "Average Cost": pl.Float64,
+                "Account": pl.String,
+                "Asset Class": pl.String,
+                "Sector": pl.String,
+                "Acquired": pl.String,
+            },
+        )
 
     def add_position(
         self,
@@ -146,36 +168,17 @@ class UserDataRepository:
             )
         return self.list_watchlist()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA foreign_keys = ON")
-        return connection
-
-    def _import_portfolio(
-        self, connection: sqlite3.Connection, portfolio_path: Path
-    ) -> None:
-        lots = load_portfolio_lots(portfolio_path)
-        for row in lots.to_dicts():
-            connection.execute(
-                """
-                INSERT INTO positions(
-                    id, symbol, quantity, average_cost, account,
-                    asset_class, sector, acquired
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(uuid.uuid4()),
-                    row["Symbol"],
-                    row["Quantity"],
-                    row["Average Cost"],
-                    row["Account"],
-                    row["Asset Class"],
-                    row["Sector"],
-                    row["Acquired"].isoformat() if row["Acquired"] else None,
-                ),
-            )
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     @staticmethod
     def _is_seeded(connection: sqlite3.Connection, key: str) -> bool:

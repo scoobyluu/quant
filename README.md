@@ -26,10 +26,16 @@ Refresh the index cache from Yahoo Finance:
 uv run quant index --refresh
 ```
 
-Analyze `portfolio.csv` using cached prices first:
+Analyze the SQLite portfolio using cached prices first:
 
 ```sh
 uv run quant portfolio
+```
+
+Use an alternate SQLite database when needed:
+
+```sh
+uv run quant portfolio --database /path/to/quant.db
 ```
 
 Analyze selected symbols with explicit trading-session windows and price basis:
@@ -47,9 +53,9 @@ uv run quant market --index --windows 5 20 --price adjusted
 Market analysis calculates daily price changes, moving averages, rolling
 highs/lows, volume averages, and relative volume.
 
-The portfolio CSV requires `ticker`, `quantity`, and `cost`, where `cost` is the
-average cost per share. Optional `account`, `asset_class`, `sector`, and
-`acquired` columns are accepted during import.
+Portfolio positions are stored as individual lots in SQLite. Each lot records
+the symbol, quantity, average cost, and optional account, asset class, sector,
+and acquired date metadata.
 
 ## Dashboard
 
@@ -74,9 +80,14 @@ Routes:
 The dashboard includes a watchlist, holdings, stock history, fundamentals,
 analyst ratings, earnings, options, and news.
 
-On first use, `portfolio.csv` is imported into `data/quant.db`. The dashboard
-then treats SQLite as the source of truth for position lots and watchlists; the
-CSV remains an import/export format.
+FastAPI routes delegate portfolio and technical calculations to the shared
+Polars services. Yahoo research and intraday responses are isolated behind a
+separate provider boundary.
+
+The CLI and dashboard both use `data/quant.db` as the source of truth for
+position lots and watchlists. Positions are added and removed through the
+dashboard API or by writing to the repository; CSV is no longer part of the
+runtime portfolio workflow.
 
 ## Storage
 
@@ -84,7 +95,6 @@ CSV remains an import/export format.
 - `data/portfolio_market_data.parquet` stores supplemental portfolio quotes.
 - `data/market_analysis.parquet` stores full bars used by market analysis.
 - `data/quant.db` stores app-managed position lots and watchlists.
-- `portfolio.csv` is the import format for portfolio positions.
 
 ## Tests
 
@@ -94,3 +104,6 @@ PYTHONDONTWRITEBYTECODE=1 uv run python -m unittest discover -s tests
 
 Unit tests must mock Yahoo and Wikipedia boundaries; they should not require
 network access.
+
+See `INTEGRATION_REVIEW.md` for the merged PR inventory, consolidated ownership,
+and intentional CLI/web differences that remain open for product review.

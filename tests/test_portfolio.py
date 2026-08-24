@@ -6,28 +6,11 @@ from unittest.mock import patch
 
 import polars as pl
 
-from quant.portfolio import load_portfolio, load_portfolio_market_data
+from quant.portfolio import analyze_positions, load_portfolio_market_data
 from quant.storage import load_market_data, save_market_data
 
 
 class PortfolioInputTests(unittest.TestCase):
-    def test_combines_duplicate_positions_at_weighted_average_cost(self) -> None:
-        with TemporaryDirectory() as directory:
-            path = Path(directory) / "portfolio.csv"
-            pl.DataFrame(
-                {
-                    "ticker": ["aapl", " AAPL "],
-                    "quantity": [2, 1],
-                    "cost": [100.0, 130.0],
-                }
-            ).write_csv(path)
-
-            result = load_portfolio(path)
-
-        self.assertEqual(result.to_dicts(), [
-            {"Symbol": "AAPL", "Quantity": 3.0, "Average Cost": 110.0}
-        ])
-
     @patch("quant.quotes.get_market_history")
     def test_downloads_and_caches_only_missing_symbols(self, get_market_history) -> None:
         primary_data = pl.DataFrame(
@@ -68,6 +51,32 @@ class PortfolioInputTests(unittest.TestCase):
             get_market_history.reset_mock()
             load_portfolio_market_data(["AAPL", "VOO"], primary_path, portfolio_path)
             get_market_history.assert_not_called()
+
+    @patch("quant.portfolio.load_portfolio_market_data")
+    def test_analyzes_positions_through_shared_quote_resolution(self, load_market_data) -> None:
+        positions = pl.DataFrame(
+            {
+                "Symbol": ["AAPL", "AAPL"],
+                "Quantity": [1.0, 2.0],
+                "Average Cost": [100.0, 110.0],
+                "Account": ["taxable", "roth"],
+            }
+        )
+        load_market_data.return_value = pl.DataFrame(
+            {
+                "Date": [date(2026, 8, 21)],
+                "Symbol": ["AAPL"],
+                "Last Price": [125.0],
+                "Volume": [2_000_000],
+            }
+        )
+
+        result = analyze_positions(positions)
+
+        self.assertEqual(result.height, 2)
+        self.assertEqual(result.get_column("Market Value").to_list(), [250.0, 125.0])
+        load_market_data.assert_called_once()
+        self.assertEqual(load_market_data.call_args.args[0], ["AAPL"])
 
 
 if __name__ == "__main__":

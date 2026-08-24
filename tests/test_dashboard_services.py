@@ -6,14 +6,15 @@ from unittest.mock import patch
 
 import polars as pl
 
+from quant.analysis import analyze_portfolio
 from quant.dashboard.services import DashboardService
 from quant.user_data import UserDataRepository
 
 
 class DashboardServiceTests(unittest.TestCase):
-    @patch("quant.dashboard.services.load_portfolio_market_data")
-    def test_values_persisted_lots_with_core_analysis(self, load_market_data) -> None:
-        load_market_data.return_value = pl.DataFrame(
+    @patch("quant.dashboard.services.analyze_positions")
+    def test_values_persisted_lots_with_core_analysis(self, analyze_positions) -> None:
+        market_data = pl.DataFrame(
             {
                 "Date": [date(2026, 8, 21)],
                 "Symbol": ["AAPL"],
@@ -21,9 +22,12 @@ class DashboardServiceTests(unittest.TestCase):
                 "Volume": [1_000],
             }
         )
+        analyze_positions.side_effect = lambda positions, *_: analyze_portfolio(
+            positions, market_data
+        )
         with TemporaryDirectory() as directory:
             repository = UserDataRepository(Path(directory) / "quant.db")
-            repository.initialize(Path(directory) / "missing.csv")
+            repository.initialize()
             repository.add_position(
                 "AAPL",
                 2,

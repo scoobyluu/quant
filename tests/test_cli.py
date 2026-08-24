@@ -20,7 +20,7 @@ class CliTests(unittest.TestCase):
         parser = _build_parser()
 
         index = parser.parse_args(["index", "--cache", "index.parquet"])
-        portfolio = parser.parse_args(["portfolio", "--file", "holdings.csv"])
+        portfolio = parser.parse_args(["portfolio", "--database", "holdings.db"])
         market = parser.parse_args(
             [
                 "market",
@@ -35,7 +35,7 @@ class CliTests(unittest.TestCase):
         )
 
         self.assertEqual(index.cache, Path("index.parquet"))
-        self.assertEqual(portfolio.file, Path("holdings.csv"))
+        self.assertEqual(portfolio.database, Path("holdings.db"))
         self.assertEqual(market.symbols, ["AAPL", "MSFT"])
         self.assertEqual(market.windows, [5, 20])
         self.assertEqual(market.price, "adjusted")
