@@ -1864,6 +1864,7 @@ function renderPortfolioCurve(a, onChart) {
 const SIGNAL_LABELS = {
   value: "Value",
   cheap: "Cheap",
+  "fcfy+": "FCF+",
   quality: "Quality",
   growth: "Growth",
   momentum: "Momentum",
@@ -1907,7 +1908,7 @@ async function renderScreener() {
       {},
       "Composite is the mean of four 0–100 factor scores: ",
       h("strong", {}, "Value"),
-      " (forward PE / PEG / P/B / P/S), ",
+      " (forward P/E, PEG, P/B, P/S, FCF yield), ",
       h("strong", {}, "Quality"),
       " (ROE, margins, revenue growth, debt/equity), ",
       h("strong", {}, "Return"),
@@ -1918,7 +1919,13 @@ async function renderScreener() {
     h(
       "div",
       { style: { marginTop: "6px" } },
-      "Signal chips highlight thresholds retail investors typically screen on — a row lighting up ≥3 chips is the multi-factor case."
+      h("strong", {}, "Value / Quality are sector-relative"),
+      " — a bank at P/E 12 isn't the same as software at P/E 12, so each factor is scored against percentiles within the ticker's sector. Return / Momentum use absolute thresholds (Sharpe > 1 etc.)."
+    ),
+    h(
+      "div",
+      { style: { marginTop: "6px" } },
+      "Signal chips highlight rules of thumb retail investors screen on — a row lighting up ≥3 chips is the multi-factor case."
     )
   );
 
@@ -1966,6 +1973,7 @@ async function renderScreener() {
         h("th", {}, "α (ann.)"),
         h("th", {}, "Fwd P/E"),
         h("th", {}, "PEG"),
+        h("th", {}, "FCF Yld"),
         h("th", {}, "ROE"),
         h("th", {}, "Upside")
       )
@@ -2033,6 +2041,11 @@ async function renderScreener() {
         ),
         h("td", {}, typeof f.forwardPE === "number" ? fmtNum(f.forwardPE, 2) : "—"),
         h("td", {}, typeof f.pegRatio === "number" ? fmtNum(f.pegRatio, 2) : "—"),
+        h(
+          "td",
+          { class: (f.fcfYield ?? 0) >= 0.05 ? "up" : "muted" },
+          typeof f.fcfYield === "number" ? fmtPct(f.fcfYield * 100) : "—"
+        ),
         h("td", {}, typeof f.roe === "number" ? fmtPct(f.roe * 100) : "—"),
         h(
           "td",

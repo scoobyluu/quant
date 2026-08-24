@@ -198,10 +198,27 @@ curl -s 'http://127.0.0.1:8001/api/screener?symbols=AAPL,MSFT,GOOGL,NVDA'
 Factor buckets (each 0–100, averaged into the composite; missing factors are
 skipped, not zeroed):
 
-- **Value** — forward P/E, PEG, price/book, price/sales
+- **Value** — forward P/E, PEG, price/book, price/sales, **FCF yield**
 - **Quality** — ROE, profit margin, revenue growth, debt/equity
 - **Return** — 1Y Sharpe and annualized alpha vs SPY
 - **Momentum** — 1M, YTD, and 1Y return
+
+**Value and Quality are scored by sector-relative percentile.** A P/E of 15 is
+cheap for a bank but expensive for software, so scoring every ticker against
+an absolute P/E scale produces nonsense. Each factor is instead ranked within
+the ticker's sector against a hardcoded universe of ~45 sector representatives
+(fetched in parallel and cached). Return and Momentum stay on absolute scales
+— Sharpe > 1 is a market truth, not a sector one. When a sector has < 3 peers
+in the universe (unusual / ETF), scoring falls back to the absolute
+piecewise-linear scale.
+
+The response includes:
+
+- `rows` — sorted by composite score, descending
+- `sectorPeerCounts` — how many peers were available per sector per factor
+  (a coverage hint for interpretation)
+- `scoring.value` / `scoring.quality` per row — which basis (`sector` or
+  `absolute`) each factor scored on, useful for debugging
 
 Signals emitted per row:
 
@@ -209,6 +226,7 @@ Signals emitted per row:
 |-----------|-----------------------------------------------------------|
 | `value`   | Forward P/E < 20 AND (PEG < 1.5 OR P/B < 3)               |
 | `cheap`   | Forward P/E < 15                                          |
+| `fcfy+`   | FCF yield > 5% (strong value signal, hard to fake)        |
 | `quality` | ROE > 15% AND profit margin > 10%                         |
 | `growth`  | Revenue growth > 10%                                      |
 | `momentum`| 1M > 0 AND YTD > 0                                        |
@@ -216,8 +234,7 @@ Signals emitted per row:
 | `alpha+`  | Annualized alpha vs SPY > 2%                              |
 | `upside`  | Analyst mean target > 15% above current price             |
 
-Rows come back sorted by composite score, descending. A row lighting up ≥3
-chips is the multi-factor case.
+A row lighting up ≥3 chips is the multi-factor case.
 
 ### Holdings seeding
 

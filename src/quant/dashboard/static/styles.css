@@ -240,6 +240,7 @@ a:hover { text-decoration: underline; }
 }
 .pill.signal-value,
 .pill.signal-cheap,
+.pill.signal-fcfy\+,
 .pill.signal-quality { border-color: var(--up); color: var(--up); background: #0f2b1b; }
 .pill.signal-growth,
 .pill.signal-momentum { border-color: var(--accent); color: var(--accent); background: #10203a; }

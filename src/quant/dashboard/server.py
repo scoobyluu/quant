@@ -979,90 +979,153 @@ def symbol_analytics(
 # ---- Screener ----
 #
 # The screener ranks a set of symbols across four factor buckets:
-#   Value      — cheap on forward PE / PEG / P/B / P/S
+#   Value      — cheap on forward P/E / PEG / P/B / P/S / FCF yield
 #   Quality    — high ROE, margins, revenue growth, low leverage
 #   Return     — good risk-adjusted return (Sharpe) and market-adjusted alpha
 #   Momentum   — recent 1M / YTD / 1Y returns
 #
-# Each factor is scored 0–100 with piecewise-linear scaling calibrated to
-# rough retail rules of thumb (Peter Lynch PEG < 1, ROE > 15%, Sharpe > 1, etc.).
-# Composite = mean of the available factor scores. Signals are boolean chips
-# for quick scanning; they're derived from the same raw factors.
+# Value and Quality are scored by SECTOR-RELATIVE PERCENTILE — a P/E of 15 is
+# cheap for a bank but expensive for software, so scoring each ticker against
+# an absolute PE curve produces nonsense. We fetch a hardcoded set of sector
+# representatives per request (all cached long enough that repeated hits pay
+# nothing) and compute per-sector percentile samples on the fly.
+#
+# Return and Momentum stay on absolute scales — Sharpe > 1 is a market truth,
+# not a sector one.
+
+
+# Sector representatives: enough coverage per sector (2-5 names) that
+# percentiles are meaningful, small enough that cold fetches finish in seconds.
+SECTOR_UNIVERSE = [
+    "AAPL", "MSFT", "NVDA", "GOOGL", "META", "ORCL",   # Tech + Comm Services
+    "JPM", "BAC", "GS", "MS", "WFC",                   # Financials
+    "JNJ", "UNH", "PFE", "MRK", "ABBV",                # Healthcare
+    "AMZN", "HD", "MCD", "NKE", "SBUX",                # Consumer Discretionary
+    "WMT", "PG", "KO", "PEP", "COST",                  # Consumer Staples
+    "BA", "CAT", "GE", "HON", "UNP",                   # Industrials
+    "XOM", "CVX", "COP", "SLB",                        # Energy
+    "NEE", "SO", "DUK",                                # Utilities
+    "LIN", "FCX", "ECL",                               # Materials
+    "PLD", "AMT", "O",                                 # Real Estate
+    "DIS", "NFLX", "T", "VZ",                          # Communication Services
+]
 
 
 def _clamp01(x: float) -> float:
     return max(0.0, min(100.0, x))
 
 
-def _score_value(info: dict) -> float | None:
-    """Cheaper multiples score higher. Averages whatever's available."""
-    parts: list[float] = []
-    fpe = info.get("forwardPE") or info.get("trailingPE")
-    if isinstance(fpe, (int, float)) and fpe > 0:
-        # 10 → 100, 30 → 0
-        parts.append(_clamp01(100.0 - (fpe - 10) * 5))
-    peg = info.get("pegRatio")
-    if isinstance(peg, (int, float)) and peg > 0:
-        # 0.5 → 100, 2.0 → 0
-        parts.append(_clamp01(100.0 - (peg - 0.5) * (100 / 1.5)))
-    pb = info.get("priceToBook")
-    if isinstance(pb, (int, float)) and pb > 0:
-        # 1 → 100, 6 → 0
-        parts.append(_clamp01(100.0 - (pb - 1) * 20))
-    ps = info.get("priceToSalesTrailing12Months")
-    if isinstance(ps, (int, float)) and ps > 0:
-        # 1 → 100, 10 → 0
-        parts.append(_clamp01(100.0 - (ps - 1) * (100 / 9)))
-    return sum(parts) / len(parts) if parts else None
+def _fcf_yield(info: dict) -> float | None:
+    """FCF / market cap. Retail-friendly value signal, harder to fake than PE."""
+    fcf = info.get("freeCashflow")
+    mc = info.get("marketCap")
+    if isinstance(fcf, (int, float)) and isinstance(mc, (int, float)) and mc > 0:
+        return fcf / mc
+    return None
 
 
-def _score_quality(info: dict) -> float | None:
-    """High ROE / margins / growth + low leverage score higher."""
+# Factor spec: (key, extract, higher_better, absolute_score_fn)
+# The absolute fallback kicks in when we lack ≥3 sector peers to compute a
+# percentile against — mainly for unusual sectors and ETFs.
+VALUE_FACTORS: list[tuple[str, Any, bool, Any]] = [
+    ("forwardPE",     lambda i: i.get("forwardPE") or i.get("trailingPE"),
+        False, lambda v: _clamp01(100.0 - (v - 10) * 5)),
+    ("pegRatio",      lambda i: i.get("pegRatio"),
+        False, lambda v: _clamp01(100.0 - (v - 0.5) * (100 / 1.5))),
+    ("priceToBook",   lambda i: i.get("priceToBook"),
+        False, lambda v: _clamp01(100.0 - (v - 1) * 20)),
+    ("priceToSales",  lambda i: i.get("priceToSalesTrailing12Months"),
+        False, lambda v: _clamp01(100.0 - (v - 1) * (100 / 9))),
+    ("fcfYield",      _fcf_yield,
+        True,  lambda v: _clamp01(v * 100 * 15)),  # 6.67% yield → 100
+]
+
+QUALITY_FACTORS: list[tuple[str, Any, bool, Any]] = [
+    ("roe",           lambda i: i.get("returnOnEquity"),
+        True,  lambda v: _clamp01(v * 100 * 3)),
+    ("profitMargin",  lambda i: i.get("profitMargins"),
+        True,  lambda v: _clamp01(v * 100 * 5)),
+    ("revenueGrowth", lambda i: i.get("revenueGrowth"),
+        True,  lambda v: _clamp01(v * 100 * 3)),
+    ("debtToEquity",  lambda i: i.get("debtToEquity"),
+        False, lambda v: _clamp01(100.0 - v * 0.5)),  # yfinance reports % (100 = 1.0x)
+]
+
+
+def _percentile_rank(value: float, samples: list[float]) -> float:
+    """Fraction of samples <= value, in [0, 1]. Empty samples → 0.5 (neutral)."""
+    if not samples:
+        return 0.5
+    return sum(1 for s in samples if s <= value) / len(samples)
+
+
+def _build_sector_stats(infos: list[dict]) -> dict[str, dict[str, list[float]]]:
+    """Group each factor's raw values by sector for percentile lookups."""
+    stats: dict[str, dict[str, list[float]]] = {}
+    for info_row in infos:
+        sector = info_row.get("sector")
+        if not sector:
+            continue
+        bucket = stats.setdefault(sector, {})
+        for key, extract, _higher, _absolute in VALUE_FACTORS + QUALITY_FACTORS:
+            v = extract(info_row)
+            if isinstance(v, (int, float)) and not (math.isnan(v) or math.isinf(v)):
+                bucket.setdefault(key, []).append(float(v))
+    return stats
+
+
+def _score_bucket(
+    info_row: dict,
+    factors_spec: list[tuple[str, Any, bool, Any]],
+    sector_stats: dict[str, dict[str, list[float]]],
+) -> tuple[float | None, dict[str, str]]:
+    """Score a factor bucket, preferring sector percentiles over absolute scales.
+
+    Returns (score, basis_by_factor) where basis is "sector" or "absolute" per
+    factor — useful for debugging and for the UI to indicate coverage.
+    """
     parts: list[float] = []
-    roe = info.get("returnOnEquity")
-    if isinstance(roe, (int, float)):
-        # 33% ROE → 100, 0% → 0
-        parts.append(_clamp01(roe * 100 * 3))
-    pm = info.get("profitMargins")
-    if isinstance(pm, (int, float)):
-        # 20% margin → 100
-        parts.append(_clamp01(pm * 100 * 5))
-    rg = info.get("revenueGrowth")
-    if isinstance(rg, (int, float)):
-        # 33% growth → 100
-        parts.append(_clamp01(rg * 100 * 3))
-    de = info.get("debtToEquity")
-    if isinstance(de, (int, float)):
-        # yfinance reports debtToEquity as a percentage (100 = 1.0x).
-        # 0 → 100, 200% → 0
-        parts.append(_clamp01(100.0 - de * 0.5))
-    return sum(parts) / len(parts) if parts else None
+    basis: dict[str, str] = {}
+    sector = info_row.get("sector")
+    for key, extract, higher, absolute in factors_spec:
+        v = extract(info_row)
+        if not isinstance(v, (int, float)) or math.isnan(v) or math.isinf(v):
+            continue
+        samples = (sector_stats.get(sector) or {}).get(key) if sector else None
+        # Need ≥3 samples for the percentile to mean anything (and drop self so
+        # the target isn't scoring against itself).
+        peers = [s for s in samples if s != v] if samples else []
+        if peers and len(peers) >= 3:
+            rank = _percentile_rank(v, peers)
+            parts.append(rank * 100 if higher else (1 - rank) * 100)
+            basis[key] = "sector"
+        else:
+            parts.append(absolute(v))
+            basis[key] = "absolute"
+    return (sum(parts) / len(parts) if parts else None), basis
 
 
 def _score_return(sharpe: float | None, alpha: float | None) -> float | None:
-    """Sharpe > 1 and positive alpha score higher."""
+    """Sharpe > 1 and positive alpha score higher. Absolute — not sector-relative."""
     parts: list[float] = []
     if isinstance(sharpe, (int, float)):
-        # -1 → 0, 2 → 100
-        parts.append(_clamp01((sharpe + 1) * 100 / 3))
+        parts.append(_clamp01((sharpe + 1) * 100 / 3))       # -1 → 0, 2 → 100
     if isinstance(alpha, (int, float)):
-        # -10% ann. alpha → 0, +20% → 100
-        parts.append(_clamp01((alpha + 0.1) * 100 / 0.3))
+        parts.append(_clamp01((alpha + 0.1) * 100 / 0.3))    # -10% → 0, +20% → 100
     return sum(parts) / len(parts) if parts else None
 
 
 def _score_momentum(one_month: float | None, ytd: float | None, cum: float | None) -> float | None:
-    """Positive recent + longer-term returns score higher."""
+    """Positive recent + longer-term returns score higher. Absolute."""
     parts: list[float] = []
     for v in (one_month, ytd, cum):
         if isinstance(v, (int, float)):
-            # -20% → 0, +40% → 100
-            parts.append(_clamp01((v + 0.2) * 100 / 0.6))
+            parts.append(_clamp01((v + 0.2) * 100 / 0.6))    # -20% → 0, +40% → 100
     return sum(parts) / len(parts) if parts else None
 
 
 def _signals(factors: dict) -> list[str]:
-    """Boolean flags — the multi-factor case for the stock in a glance."""
+    """Boolean flags — the multi-factor case for the stock at a glance."""
     out: list[str] = []
     fpe = factors.get("forwardPE")
     peg = factors.get("pegRatio")
@@ -1077,6 +1140,9 @@ def _signals(factors: dict) -> list[str]:
         out.append("value")
     if isinstance(fpe, (int, float)) and 0 < fpe < 15:
         out.append("cheap")
+    fcfy = factors.get("fcfYield")
+    if isinstance(fcfy, (int, float)) and fcfy > 0.05:
+        out.append("fcfy+")
     roe = factors.get("roe")
     pm = factors.get("profitMargin")
     if isinstance(roe, (int, float)) and roe > 0.15 and isinstance(pm, (int, float)) and pm > 0.10:
@@ -1110,8 +1176,11 @@ def screener(
     """Multi-factor screener: composite score + signal chips per symbol.
 
     Combines fundamentals from `.info` with 1Y risk-adjusted return metrics
-    computed against SPY. Ranks by composite score (mean of available factor
-    scores). See scoring helpers for the exact scales used.
+    computed against SPY. Value and Quality are scored against SECTOR
+    PERCENTILES (using a hardcoded universe of sector representatives) so a
+    bank's PE isn't compared to software's PE. Return and Momentum stay on
+    absolute scales. Ranks by composite score (mean of available factor
+    scores).
     """
     if symbols:
         syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
@@ -1123,6 +1192,21 @@ def screener(
     if not syms:
         return {"rows": [], "benchmark": BENCHMARK_SYMBOL, "period": "1y"}
 
+    # Fetch info for the user's tickers + hardcoded sector reps in parallel.
+    # info() is cached, so warm requests skip everything but the compute stage.
+    universe = sorted(set(syms) | set(SECTOR_UNIVERSE))
+
+    def fetch_info(sym: str) -> dict:
+        try:
+            return info(sym)
+        except HTTPException:
+            return {}
+
+    with ThreadPoolExecutor(max_workers=min(len(universe), 12)) as ex:
+        info_by_sym = dict(zip(universe, ex.map(fetch_info, universe)))
+
+    sector_stats = _build_sector_stats(list(info_by_sym.values()))
+
     # Shared benchmark for alpha/beta — one fetch spans every row.
     try:
         bench_closes = _daily_closes(BENCHMARK_SYMBOL, "1y")
@@ -1131,10 +1215,7 @@ def screener(
     bench_returns_by_date = _returns_by_date(bench_closes) if bench_closes else {}
 
     def compute(sym: str) -> dict:
-        try:
-            info_row = info(sym)
-        except HTTPException:
-            info_row = {}
+        info_row = info_by_sym.get(sym) or {}
         try:
             closes = _daily_closes(sym, "1y")
         except Exception:
@@ -1172,6 +1253,9 @@ def screener(
             if bench_returns_by_date:
                 beta, alpha = _beta_alpha(sym_returns_by_date, bench_returns_by_date)
 
+        value_score, value_basis = _score_bucket(info_row, VALUE_FACTORS, sector_stats)
+        quality_score, quality_basis = _score_bucket(info_row, QUALITY_FACTORS, sector_stats)
+
         factors = {
             # Value
             "forwardPE": info_row.get("forwardPE"),
@@ -1179,6 +1263,7 @@ def screener(
             "pegRatio": info_row.get("pegRatio"),
             "priceToBook": info_row.get("priceToBook"),
             "priceToSales": info_row.get("priceToSalesTrailing12Months"),
+            "fcfYield": _fcf_yield(info_row),
             "dividendYield": info_row.get("dividendYield"),
             # Quality
             "roe": info_row.get("returnOnEquity"),
@@ -1204,8 +1289,8 @@ def screener(
         }
 
         scores = {
-            "value": _score_value(info_row),
-            "quality": _score_quality(info_row),
+            "value": value_score,
+            "quality": quality_score,
             "return": _score_return(stats.get("sharpe"), alpha),
             "momentum": _score_momentum(one_month, ytd, stats.get("cumulativeReturn")),
         }
@@ -1219,6 +1304,7 @@ def screener(
             "price": price,
             "compositeScore": composite,
             "scores": scores,
+            "scoring": {"value": value_basis, "quality": quality_basis},
             "factors": factors,
             "signals": _signals(factors),
         }
@@ -1226,10 +1312,16 @@ def screener(
     with ThreadPoolExecutor(max_workers=min(len(syms), 10)) as ex:
         rows = list(ex.map(compute, syms))
     rows.sort(key=lambda r: r.get("compositeScore") or 0.0, reverse=True)
+
+    # Report peer-count coverage per sector so the UI (and curl users) know how
+    # much percentile scoring actually kicked in vs. absolute fallback.
+    peers_by_sector = {sec: {k: len(v) for k, v in bucket.items()} for sec, bucket in sector_stats.items()}
+
     return _clean(
         {
             "benchmark": BENCHMARK_SYMBOL,
             "period": "1y",
+            "sectorPeerCounts": peers_by_sector,
             "rows": rows,
         }
     )
