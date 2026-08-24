@@ -219,6 +219,9 @@ The response includes:
   (a coverage hint for interpretation)
 - `scoring.value` / `scoring.quality` per row — which basis (`sector` or
   `absolute`) each factor scored on, useful for debugging
+- `coverage` per row — `{used, total, ratio}` counting how many of the 14
+  possible factor inputs were available. Rows below 50% coverage are dimmed
+  in the UI since the composite is being averaged over a thin subset.
 
 Signals emitted per row:
 
@@ -226,6 +229,7 @@ Signals emitted per row:
 |-----------|-----------------------------------------------------------|
 | `value`   | Forward P/E < 20 AND (PEG < 1.5 OR P/B < 3)               |
 | `cheap`   | Forward P/E < 15                                          |
+| `trap`    | Would-be `value`/`cheap` BUT revenue < 0 OR earnings < -10% (value-trap guard: replaces the value/cheap chips) |
 | `fcfy+`   | FCF yield > 5% (strong value signal, hard to fake)        |
 | `quality` | ROE > 15% AND profit margin > 10%                         |
 | `growth`  | Revenue growth > 10%                                      |
@@ -234,7 +238,9 @@ Signals emitted per row:
 | `alpha+`  | Annualized alpha vs SPY > 2%                              |
 | `upside`  | Analyst mean target > 15% above current price             |
 
-A row lighting up ≥3 chips is the multi-factor case.
+A row lighting up ≥3 chips is the multi-factor case. A `trap` chip is a
+warning: the stock looks statistically cheap but the top or bottom line is
+shrinking — the classic value-trap pattern.
 
 ### Holdings seeding
 

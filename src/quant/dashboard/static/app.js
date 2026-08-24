@@ -1871,6 +1871,7 @@ const SIGNAL_LABELS = {
   "sharpe+": "Sharpe+",
   "alpha+": "α+",
   upside: "Upside",
+  trap: "Trap?",
 };
 
 function scoreClass(v) {
@@ -1925,7 +1926,15 @@ async function renderScreener() {
     h(
       "div",
       { style: { marginTop: "6px" } },
-      "Signal chips highlight rules of thumb retail investors screen on — a row lighting up ≥3 chips is the multi-factor case."
+      "Signal chips highlight rules of thumb retail investors screen on — a row lighting up ≥3 chips is the multi-factor case. A ",
+      h("span", { class: "pill signal signal-trap" }, "Trap?"),
+      " chip replaces Value/Cheap when the stock looks cheap but revenue (or earnings) is shrinking."
+    ),
+    h(
+      "div",
+      { style: { marginTop: "6px" } },
+      h("strong", {}, "Coverage"),
+      " tells you how many of the 14 factor inputs were available — rows below 50% are dimmed since the composite is averaged over a thin subset."
     )
   );
 
@@ -1984,13 +1993,16 @@ async function renderScreener() {
   for (const r of rows) {
     const f = r.factors || {};
     const s = r.scores || {};
+    const cov = r.coverage || {};
+    const covRatio = typeof cov.ratio === "number" ? cov.ratio : null;
+    const lowCoverage = covRatio != null && covRatio < 0.5;
     const chips = (r.signals || []).map((sig) =>
       h("span", { class: `pill signal signal-${sig}` }, SIGNAL_LABELS[sig] || sig)
     );
     body.append(
       h(
         "tr",
-        {},
+        { class: lowCoverage ? "low-coverage" : null },
         h(
           "td",
           {},
@@ -2014,7 +2026,18 @@ async function renderScreener() {
             [s.value, s.quality, s.return, s.momentum]
               .map((v) => (typeof v === "number" ? v.toFixed(0) : "—"))
               .join(" · ")
-          )
+          ),
+          typeof cov.used === "number" && typeof cov.total === "number"
+            ? h(
+                "div",
+                {
+                  class: lowCoverage ? "down small" : "muted small",
+                  title: "Factor inputs available (of 14). Lower = composite averaged over less data.",
+                  style: { marginTop: "2px" },
+                },
+                `coverage ${cov.used}/${cov.total}`
+              )
+            : null
         ),
         h(
           "td",

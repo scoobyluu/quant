@@ -1125,21 +1125,42 @@ def _score_momentum(one_month: float | None, ytd: float | None, cum: float | Non
 
 
 def _signals(factors: dict) -> list[str]:
-    """Boolean flags — the multi-factor case for the stock at a glance."""
+    """Boolean flags — the multi-factor case for the stock at a glance.
+
+    Value-trap guard: a stock that looks cheap but is shrinking on the top line
+    (revenueGrowth < 0) is more likely a value trap than a bargain. In that case
+    we strip the `value` and `cheap` chips and emit a `trap` warning instead —
+    the underlying factor scores still stand, but the chip stops advertising a
+    signal that the fundamentals contradict.
+    """
     out: list[str] = []
     fpe = factors.get("forwardPE")
     peg = factors.get("pegRatio")
     pb = factors.get("priceToBook")
-    if (
+    rg = factors.get("revenueGrowth")
+    eg = factors.get("earningsGrowth")
+
+    would_be_value = (
         isinstance(fpe, (int, float)) and 0 < fpe < 20
         and (
             (isinstance(peg, (int, float)) and 0 < peg < 1.5)
             or (isinstance(pb, (int, float)) and 0 < pb < 3)
         )
-    ):
-        out.append("value")
-    if isinstance(fpe, (int, float)) and 0 < fpe < 15:
-        out.append("cheap")
+    )
+    would_be_cheap = isinstance(fpe, (int, float)) and 0 < fpe < 15
+    shrinking = (
+        (isinstance(rg, (int, float)) and rg < 0)
+        or (isinstance(eg, (int, float)) and eg < -0.10)
+    )
+
+    if (would_be_value or would_be_cheap) and shrinking:
+        out.append("trap")
+    else:
+        if would_be_value:
+            out.append("value")
+        if would_be_cheap:
+            out.append("cheap")
+
     fcfy = factors.get("fcfYield")
     if isinstance(fcfy, (int, float)) and fcfy > 0.05:
         out.append("fcfy+")
@@ -1147,7 +1168,6 @@ def _signals(factors: dict) -> list[str]:
     pm = factors.get("profitMargin")
     if isinstance(roe, (int, float)) and roe > 0.15 and isinstance(pm, (int, float)) and pm > 0.10:
         out.append("quality")
-    rg = factors.get("revenueGrowth")
     if isinstance(rg, (int, float)) and rg > 0.10:
         out.append("growth")
     om = factors.get("oneMonth")
@@ -1164,6 +1184,38 @@ def _signals(factors: dict) -> list[str]:
     if isinstance(upside, (int, float)) and upside > 0.15:
         out.append("upside")
     return out
+
+
+# Total inputs across all four factor buckets. A row lacking data for many of
+# these gets a low coverage score — a hint that the composite isn't reliable.
+_TOTAL_FACTOR_INPUTS = (
+    len(VALUE_FACTORS) + len(QUALITY_FACTORS)
+    + 2   # return: sharpe, alpha
+    + 3   # momentum: oneMonth, ytd, cumulativeReturn
+)
+
+
+def _coverage(value_basis: dict, quality_basis: dict, factors: dict) -> dict:
+    """Fraction of the 14 possible factor inputs that were actually available.
+
+    Value/Quality contribute one point per factor that scored (regardless of
+    whether it used the sector or absolute basis — both count). Return and
+    Momentum count their component metrics directly. A coverage below ~0.5
+    means the composite is being averaged over a small subset and shouldn't
+    be trusted at face value.
+    """
+    used = len(value_basis) + len(quality_basis)
+    for k in ("sharpe", "alpha"):
+        if isinstance(factors.get(k), (int, float)):
+            used += 1
+    for k in ("oneMonth", "ytd", "cumulativeReturn"):
+        if isinstance(factors.get(k), (int, float)):
+            used += 1
+    return {
+        "used": used,
+        "total": _TOTAL_FACTOR_INPUTS,
+        "ratio": used / _TOTAL_FACTOR_INPUTS if _TOTAL_FACTOR_INPUTS else None,
+    }
 
 
 @app.get("/api/screener")
@@ -1269,6 +1321,7 @@ def screener(
             "roe": info_row.get("returnOnEquity"),
             "profitMargin": info_row.get("profitMargins"),
             "revenueGrowth": info_row.get("revenueGrowth"),
+            "earningsGrowth": info_row.get("earningsGrowth"),
             "debtToEquity": info_row.get("debtToEquity"),
             # Return
             "sharpe": stats.get("sharpe"),
@@ -1305,6 +1358,7 @@ def screener(
             "compositeScore": composite,
             "scores": scores,
             "scoring": {"value": value_basis, "quality": quality_basis},
+            "coverage": _coverage(value_basis, quality_basis, factors),
             "factors": factors,
             "signals": _signals(factors),
         }

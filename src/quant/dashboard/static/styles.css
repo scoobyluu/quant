@@ -247,6 +247,10 @@ a:hover { text-decoration: underline; }
 .pill.signal-sharpe\+,
 .pill.signal-alpha\+ { border-color: #f59e0b; color: #f59e0b; background: #2a1c05; }
 .pill.signal-upside { border-color: #a78bfa; color: #a78bfa; background: #201533; }
+.pill.signal-trap { border-color: var(--down); color: var(--down); background: #2b0f0f; }
+
+tr.low-coverage td { opacity: 0.55; }
+tr.low-coverage:hover td { opacity: 0.85; }
 
 .scroll-y { max-height: 360px; overflow-y: auto; }
 
