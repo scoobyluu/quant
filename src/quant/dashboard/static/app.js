@@ -35,6 +35,8 @@ const api = {
   watchlistAnalytics: () => j(`/api/watchlist/analytics`),
   symbolAnalytics: (s, period = "1y") =>
     j(`/api/analytics/${encodeURIComponent(s)}?period=${encodeURIComponent(period)}`),
+  screener: (symbols) =>
+    j(`/api/screener${symbols && symbols.length ? `?symbols=${encodeURIComponent(symbols.join(","))}` : ""}`),
 };
 
 async function j(path, method = "GET", body) {
@@ -1857,6 +1859,192 @@ function renderPortfolioCurve(a, onChart) {
   return panel;
 }
 
+// ---------- screener ----------
+
+const SIGNAL_LABELS = {
+  value: "Value",
+  cheap: "Cheap",
+  quality: "Quality",
+  growth: "Growth",
+  momentum: "Momentum",
+  "sharpe+": "Sharpe+",
+  "alpha+": "α+",
+  upside: "Upside",
+};
+
+function scoreClass(v) {
+  if (typeof v !== "number") return "muted";
+  if (v >= 70) return "up";
+  if (v >= 40) return "";
+  return "down";
+}
+
+async function renderScreener() {
+  const root = h("div", { class: "stack" });
+  app.replaceChildren(root);
+
+  const header = h(
+    "div",
+    {},
+    h("h1", {}, "Screener"),
+    h(
+      "div",
+      { class: "muted small" },
+      "Ranks the watchlist + holdings across four factor buckets. Signal chips flag high-conviction rows."
+    )
+  );
+
+  const legend = h(
+    "div",
+    { class: "panel muted small" },
+    h(
+      "div",
+      { style: { marginBottom: "6px", color: "var(--text)", fontWeight: "500" } },
+      "How to read the score"
+    ),
+    h(
+      "div",
+      {},
+      "Composite is the mean of four 0–100 factor scores: ",
+      h("strong", {}, "Value"),
+      " (forward PE / PEG / P/B / P/S), ",
+      h("strong", {}, "Quality"),
+      " (ROE, margins, revenue growth, debt/equity), ",
+      h("strong", {}, "Return"),
+      " (1Y Sharpe + alpha vs SPY), ",
+      h("strong", {}, "Momentum"),
+      " (1M / YTD / 1Y). Missing factors are skipped, not zeroed."
+    ),
+    h(
+      "div",
+      { style: { marginTop: "6px" } },
+      "Signal chips highlight thresholds retail investors typically screen on — a row lighting up ≥3 chips is the multi-factor case."
+    )
+  );
+
+  const panel = h("div", { class: "panel", style: { padding: 0, overflow: "hidden" } });
+  panel.append(h("div", { class: "muted", style: { padding: "24px" } }, "Loading…"));
+  root.append(header, legend, panel);
+
+  let data;
+  try {
+    data = await api.screener();
+  } catch (e) {
+    panel.replaceChildren(
+      h("div", { class: "error", style: { margin: "16px" } }, `Screener unavailable: ${e.message}`)
+    );
+    return;
+  }
+
+  const rows = data.rows || [];
+  if (!rows.length) {
+    panel.replaceChildren(
+      h(
+        "div",
+        { class: "muted", style: { padding: "24px", textAlign: "center" } },
+        "No symbols to score. Add a watchlist entry or a holding."
+      )
+    );
+    return;
+  }
+
+  const table = h(
+    "table",
+    {},
+    h(
+      "thead",
+      {},
+      h(
+        "tr",
+        {},
+        h("th", {}, "Symbol"),
+        h("th", {}, "Score"),
+        h("th", {}, "Signals"),
+        h("th", {}, "Price"),
+        h("th", {}, "1Y"),
+        h("th", {}, "Sharpe"),
+        h("th", {}, "α (ann.)"),
+        h("th", {}, "Fwd P/E"),
+        h("th", {}, "PEG"),
+        h("th", {}, "ROE"),
+        h("th", {}, "Upside")
+      )
+    ),
+    h("tbody", {})
+  );
+  const body = table.querySelector("tbody");
+  for (const r of rows) {
+    const f = r.factors || {};
+    const s = r.scores || {};
+    const chips = (r.signals || []).map((sig) =>
+      h("span", { class: `pill signal signal-${sig}` }, SIGNAL_LABELS[sig] || sig)
+    );
+    body.append(
+      h(
+        "tr",
+        {},
+        h(
+          "td",
+          {},
+          h("a", { href: `#/stock/${r.symbol}` }, r.symbol),
+          r.name ? h("div", { class: "muted small" }, r.name) : null
+        ),
+        h(
+          "td",
+          {},
+          h(
+            "div",
+            {
+              class: scoreClass(r.compositeScore),
+              style: { fontWeight: "600", fontSize: "16px" },
+            },
+            typeof r.compositeScore === "number" ? r.compositeScore.toFixed(0) : "—"
+          ),
+          h(
+            "div",
+            { class: "muted small", title: "Value / Quality / Return / Momentum" },
+            [s.value, s.quality, s.return, s.momentum]
+              .map((v) => (typeof v === "number" ? v.toFixed(0) : "—"))
+              .join(" · ")
+          )
+        ),
+        h(
+          "td",
+          {},
+          chips.length
+            ? h("div", { class: "row", style: { gap: "4px" } }, ...chips)
+            : h("span", { class: "muted small" }, "—")
+        ),
+        h("td", {}, fmtMoney(r.price)),
+        h(
+          "td",
+          { class: (f.cumulativeReturn ?? 0) >= 0 ? "up" : "down" },
+          typeof f.cumulativeReturn === "number" ? fmtPct(f.cumulativeReturn * 100) : "—"
+        ),
+        h(
+          "td",
+          { class: (f.sharpe ?? 0) >= 1 ? "up" : "muted" },
+          typeof f.sharpe === "number" ? fmtNum(f.sharpe, 2) : "—"
+        ),
+        h(
+          "td",
+          { class: (f.alpha ?? 0) >= 0 ? "up" : "down" },
+          typeof f.alpha === "number" ? fmtPct(f.alpha * 100) : "—"
+        ),
+        h("td", {}, typeof f.forwardPE === "number" ? fmtNum(f.forwardPE, 2) : "—"),
+        h("td", {}, typeof f.pegRatio === "number" ? fmtNum(f.pegRatio, 2) : "—"),
+        h("td", {}, typeof f.roe === "number" ? fmtPct(f.roe * 100) : "—"),
+        h(
+          "td",
+          { class: (f.targetUpside ?? 0) >= 0 ? "up" : "down" },
+          typeof f.targetUpside === "number" ? fmtPct(f.targetUpside * 100) : "—"
+        )
+      )
+    );
+  }
+  panel.replaceChildren(table);
+}
+
 // ---------- router ----------
 
 function router() {
@@ -1867,6 +2055,7 @@ function router() {
   });
   if (hash === "/" || hash === "") return renderWatchlist();
   if (hash === "/holdings") return renderHoldings();
+  if (hash === "/screener") return renderScreener();
   const m = hash.match(/^\/stock\/(.+)$/);
   if (m) return renderStock(decodeURIComponent(m[1]));
   app.replaceChildren(h("div", { class: "panel" }, "Not found. ", h("a", { href: "#/" }, "Home")));

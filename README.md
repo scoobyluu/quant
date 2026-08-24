@@ -181,6 +181,44 @@ Modeling notes:
 - Risk contributions sum to ≈1 (not exactly, since the portfolio return series
   reflects drifting weights while the decomposition uses current weights).
 
+### Screener
+
+Multi-factor ranking of the watchlist ∪ holdings (or an explicit `symbols=`
+list). Each row gets a 0–100 composite score plus a set of boolean signal
+chips for at-a-glance scanning.
+
+```sh
+# default: watchlist + holdings unioned
+curl -s http://127.0.0.1:8001/api/screener
+
+# explicit list (max 30)
+curl -s 'http://127.0.0.1:8001/api/screener?symbols=AAPL,MSFT,GOOGL,NVDA'
+```
+
+Factor buckets (each 0–100, averaged into the composite; missing factors are
+skipped, not zeroed):
+
+- **Value** — forward P/E, PEG, price/book, price/sales
+- **Quality** — ROE, profit margin, revenue growth, debt/equity
+- **Return** — 1Y Sharpe and annualized alpha vs SPY
+- **Momentum** — 1M, YTD, and 1Y return
+
+Signals emitted per row:
+
+| Signal    | Rule of thumb                                             |
+|-----------|-----------------------------------------------------------|
+| `value`   | Forward P/E < 20 AND (PEG < 1.5 OR P/B < 3)               |
+| `cheap`   | Forward P/E < 15                                          |
+| `quality` | ROE > 15% AND profit margin > 10%                         |
+| `growth`  | Revenue growth > 10%                                      |
+| `momentum`| 1M > 0 AND YTD > 0                                        |
+| `sharpe+` | 1Y Sharpe > 1.0                                           |
+| `alpha+`  | Annualized alpha vs SPY > 2%                              |
+| `upside`  | Analyst mean target > 15% above current price             |
+
+Rows come back sorted by composite score, descending. A row lighting up ≥3
+chips is the multi-factor case.
+
 ### Holdings seeding
 
 On first run, `src/quant/dashboard/data/holdings.json` is auto-populated from `portfolio.csv` at the repo root. Only the `ticker`, `quantity`, and `cost` columns are read; extras are ignored.

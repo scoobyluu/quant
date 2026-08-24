@@ -313,19 +313,22 @@ def info(symbol: str) -> dict:
             "shortName", "longName", "symbol", "sector", "industry", "country", "website",
             "longBusinessSummary", "fullTimeEmployees",
             "marketCap", "enterpriseValue",
-            "trailingPE", "forwardPE", "priceToBook", "priceToSalesTrailing12Months",
+            "trailingPE", "forwardPE", "pegRatio", "priceToBook", "priceToSalesTrailing12Months",
             "trailingEps", "forwardEps",
             "dividendRate", "dividendYield", "payoutRatio", "fiveYearAvgDividendYield",
             "beta", "52WeekChange", "fiftyTwoWeekHigh", "fiftyTwoWeekLow",
             "fiftyDayAverage", "twoHundredDayAverage",
             "profitMargins", "operatingMargins", "grossMargins", "ebitdaMargins",
             "returnOnAssets", "returnOnEquity",
-            "totalRevenue", "revenuePerShare", "revenueGrowth",
+            "totalRevenue", "revenuePerShare", "revenueGrowth", "earningsGrowth",
             "grossProfits", "ebitda", "netIncomeToCommon",
             "totalCash", "totalDebt", "debtToEquity", "currentRatio", "quickRatio",
             "freeCashflow", "operatingCashflow",
             "sharesOutstanding", "floatShares", "heldPercentInsiders", "heldPercentInstitutions",
             "averageVolume", "averageVolume10days",
+            "currentPrice", "regularMarketPrice",
+            "targetMeanPrice", "targetHighPrice", "targetLowPrice", "targetMedianPrice",
+            "recommendationKey", "recommendationMean", "numberOfAnalystOpinions",
         ]
         subset = {k: raw.get(k) for k in keys}
         return _clean(subset)
@@ -969,6 +972,265 @@ def symbol_analytics(
                 "beta": beta,
                 "alpha": alpha,
             },
+        }
+    )
+
+
+# ---- Screener ----
+#
+# The screener ranks a set of symbols across four factor buckets:
+#   Value      — cheap on forward PE / PEG / P/B / P/S
+#   Quality    — high ROE, margins, revenue growth, low leverage
+#   Return     — good risk-adjusted return (Sharpe) and market-adjusted alpha
+#   Momentum   — recent 1M / YTD / 1Y returns
+#
+# Each factor is scored 0–100 with piecewise-linear scaling calibrated to
+# rough retail rules of thumb (Peter Lynch PEG < 1, ROE > 15%, Sharpe > 1, etc.).
+# Composite = mean of the available factor scores. Signals are boolean chips
+# for quick scanning; they're derived from the same raw factors.
+
+
+def _clamp01(x: float) -> float:
+    return max(0.0, min(100.0, x))
+
+
+def _score_value(info: dict) -> float | None:
+    """Cheaper multiples score higher. Averages whatever's available."""
+    parts: list[float] = []
+    fpe = info.get("forwardPE") or info.get("trailingPE")
+    if isinstance(fpe, (int, float)) and fpe > 0:
+        # 10 → 100, 30 → 0
+        parts.append(_clamp01(100.0 - (fpe - 10) * 5))
+    peg = info.get("pegRatio")
+    if isinstance(peg, (int, float)) and peg > 0:
+        # 0.5 → 100, 2.0 → 0
+        parts.append(_clamp01(100.0 - (peg - 0.5) * (100 / 1.5)))
+    pb = info.get("priceToBook")
+    if isinstance(pb, (int, float)) and pb > 0:
+        # 1 → 100, 6 → 0
+        parts.append(_clamp01(100.0 - (pb - 1) * 20))
+    ps = info.get("priceToSalesTrailing12Months")
+    if isinstance(ps, (int, float)) and ps > 0:
+        # 1 → 100, 10 → 0
+        parts.append(_clamp01(100.0 - (ps - 1) * (100 / 9)))
+    return sum(parts) / len(parts) if parts else None
+
+
+def _score_quality(info: dict) -> float | None:
+    """High ROE / margins / growth + low leverage score higher."""
+    parts: list[float] = []
+    roe = info.get("returnOnEquity")
+    if isinstance(roe, (int, float)):
+        # 33% ROE → 100, 0% → 0
+        parts.append(_clamp01(roe * 100 * 3))
+    pm = info.get("profitMargins")
+    if isinstance(pm, (int, float)):
+        # 20% margin → 100
+        parts.append(_clamp01(pm * 100 * 5))
+    rg = info.get("revenueGrowth")
+    if isinstance(rg, (int, float)):
+        # 33% growth → 100
+        parts.append(_clamp01(rg * 100 * 3))
+    de = info.get("debtToEquity")
+    if isinstance(de, (int, float)):
+        # yfinance reports debtToEquity as a percentage (100 = 1.0x).
+        # 0 → 100, 200% → 0
+        parts.append(_clamp01(100.0 - de * 0.5))
+    return sum(parts) / len(parts) if parts else None
+
+
+def _score_return(sharpe: float | None, alpha: float | None) -> float | None:
+    """Sharpe > 1 and positive alpha score higher."""
+    parts: list[float] = []
+    if isinstance(sharpe, (int, float)):
+        # -1 → 0, 2 → 100
+        parts.append(_clamp01((sharpe + 1) * 100 / 3))
+    if isinstance(alpha, (int, float)):
+        # -10% ann. alpha → 0, +20% → 100
+        parts.append(_clamp01((alpha + 0.1) * 100 / 0.3))
+    return sum(parts) / len(parts) if parts else None
+
+
+def _score_momentum(one_month: float | None, ytd: float | None, cum: float | None) -> float | None:
+    """Positive recent + longer-term returns score higher."""
+    parts: list[float] = []
+    for v in (one_month, ytd, cum):
+        if isinstance(v, (int, float)):
+            # -20% → 0, +40% → 100
+            parts.append(_clamp01((v + 0.2) * 100 / 0.6))
+    return sum(parts) / len(parts) if parts else None
+
+
+def _signals(factors: dict) -> list[str]:
+    """Boolean flags — the multi-factor case for the stock in a glance."""
+    out: list[str] = []
+    fpe = factors.get("forwardPE")
+    peg = factors.get("pegRatio")
+    pb = factors.get("priceToBook")
+    if (
+        isinstance(fpe, (int, float)) and 0 < fpe < 20
+        and (
+            (isinstance(peg, (int, float)) and 0 < peg < 1.5)
+            or (isinstance(pb, (int, float)) and 0 < pb < 3)
+        )
+    ):
+        out.append("value")
+    if isinstance(fpe, (int, float)) and 0 < fpe < 15:
+        out.append("cheap")
+    roe = factors.get("roe")
+    pm = factors.get("profitMargin")
+    if isinstance(roe, (int, float)) and roe > 0.15 and isinstance(pm, (int, float)) and pm > 0.10:
+        out.append("quality")
+    rg = factors.get("revenueGrowth")
+    if isinstance(rg, (int, float)) and rg > 0.10:
+        out.append("growth")
+    om = factors.get("oneMonth")
+    ytd = factors.get("ytd")
+    if isinstance(om, (int, float)) and om > 0 and isinstance(ytd, (int, float)) and ytd > 0:
+        out.append("momentum")
+    sharpe = factors.get("sharpe")
+    if isinstance(sharpe, (int, float)) and sharpe > 1.0:
+        out.append("sharpe+")
+    alpha = factors.get("alpha")
+    if isinstance(alpha, (int, float)) and alpha > 0.02:
+        out.append("alpha+")
+    upside = factors.get("targetUpside")
+    if isinstance(upside, (int, float)) and upside > 0.15:
+        out.append("upside")
+    return out
+
+
+@app.get("/api/screener")
+def screener(
+    symbols: str | None = Query(
+        None,
+        description="Comma-separated symbols; defaults to watchlist + holdings",
+    ),
+) -> dict:
+    """Multi-factor screener: composite score + signal chips per symbol.
+
+    Combines fundamentals from `.info` with 1Y risk-adjusted return metrics
+    computed against SPY. Ranks by composite score (mean of available factor
+    scores). See scoring helpers for the exact scales used.
+    """
+    if symbols:
+        syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    else:
+        wl: list[str] = _load_json(WATCHLIST_FILE, DEFAULT_WATCHLIST)
+        holdings_syms = list({h["symbol"].upper() for h in _load_json(HOLDINGS_FILE, [])})
+        syms = sorted(set(wl) | set(holdings_syms))
+    syms = syms[:30]
+    if not syms:
+        return {"rows": [], "benchmark": BENCHMARK_SYMBOL, "period": "1y"}
+
+    # Shared benchmark for alpha/beta — one fetch spans every row.
+    try:
+        bench_closes = _daily_closes(BENCHMARK_SYMBOL, "1y")
+    except Exception:
+        bench_closes = []
+    bench_returns_by_date = _returns_by_date(bench_closes) if bench_closes else {}
+
+    def compute(sym: str) -> dict:
+        try:
+            info_row = info(sym)
+        except HTTPException:
+            info_row = {}
+        try:
+            closes = _daily_closes(sym, "1y")
+        except Exception:
+            closes = []
+
+        price = (
+            info_row.get("currentPrice")
+            or info_row.get("regularMarketPrice")
+            or (closes[-1][1] if closes else None)
+        )
+        target = info_row.get("targetMeanPrice")
+        target_upside = (
+            (target - price) / price
+            if isinstance(target, (int, float)) and isinstance(price, (int, float)) and price
+            else None
+        )
+
+        stats: dict = {
+            "sharpe": None,
+            "sortino": None,
+            "volatility": None,
+            "maxDrawdown": None,
+            "cumulativeReturn": None,
+        }
+        one_month = None
+        ytd = None
+        beta = None
+        alpha = None
+        if len(closes) >= 2:
+            sym_returns_by_date = _returns_by_date(closes)
+            stats = _stats_from_returns(list(sym_returns_by_date.values()))
+            latest = closes[-1][0]
+            one_month = _range_return(closes, _month_ago_iso(latest))
+            ytd = _range_return(closes, _ytd_start_iso(latest))
+            if bench_returns_by_date:
+                beta, alpha = _beta_alpha(sym_returns_by_date, bench_returns_by_date)
+
+        factors = {
+            # Value
+            "forwardPE": info_row.get("forwardPE"),
+            "trailingPE": info_row.get("trailingPE"),
+            "pegRatio": info_row.get("pegRatio"),
+            "priceToBook": info_row.get("priceToBook"),
+            "priceToSales": info_row.get("priceToSalesTrailing12Months"),
+            "dividendYield": info_row.get("dividendYield"),
+            # Quality
+            "roe": info_row.get("returnOnEquity"),
+            "profitMargin": info_row.get("profitMargins"),
+            "revenueGrowth": info_row.get("revenueGrowth"),
+            "debtToEquity": info_row.get("debtToEquity"),
+            # Return
+            "sharpe": stats.get("sharpe"),
+            "sortino": stats.get("sortino"),
+            "volatility": stats.get("volatility"),
+            "maxDrawdown": stats.get("maxDrawdown"),
+            "cumulativeReturn": stats.get("cumulativeReturn"),
+            "alpha": alpha,
+            "beta": beta,
+            # Momentum
+            "oneMonth": one_month,
+            "ytd": ytd,
+            # Analyst
+            "targetMean": target,
+            "targetUpside": target_upside,
+            "recommendationMean": info_row.get("recommendationMean"),
+            "numberOfAnalystOpinions": info_row.get("numberOfAnalystOpinions"),
+        }
+
+        scores = {
+            "value": _score_value(info_row),
+            "quality": _score_quality(info_row),
+            "return": _score_return(stats.get("sharpe"), alpha),
+            "momentum": _score_momentum(one_month, ytd, stats.get("cumulativeReturn")),
+        }
+        available = [v for v in scores.values() if isinstance(v, (int, float))]
+        composite = sum(available) / len(available) if available else None
+
+        return {
+            "symbol": sym,
+            "name": info_row.get("shortName") or info_row.get("longName"),
+            "sector": info_row.get("sector"),
+            "price": price,
+            "compositeScore": composite,
+            "scores": scores,
+            "factors": factors,
+            "signals": _signals(factors),
+        }
+
+    with ThreadPoolExecutor(max_workers=min(len(syms), 10)) as ex:
+        rows = list(ex.map(compute, syms))
+    rows.sort(key=lambda r: r.get("compositeScore") or 0.0, reverse=True)
+    return _clean(
+        {
+            "benchmark": BENCHMARK_SYMBOL,
+            "period": "1y",
+            "rows": rows,
         }
     )
 
