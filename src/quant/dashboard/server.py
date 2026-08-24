@@ -905,6 +905,27 @@ def _range_return(closes: list[tuple[str, float]], start_iso: str | None) -> flo
     return last / first - 1.0
 
 
+def _twelve_one_return(closes: list[tuple[str, float]]) -> float | None:
+    """12-minus-1 momentum: return from the earliest close to the close ~1 month ago.
+
+    The most recent month is dropped because short-term returns mean-revert — a
+    well-documented reversal effect that muddies pure 12M momentum. This is the
+    canonical academic-momentum construction.
+    """
+    if len(closes) < 2:
+        return None
+    latest = closes[-1][0]
+    cutoff = _month_ago_iso(latest)
+    trimmed = [(d, c) for d, c in closes if d <= cutoff]
+    if len(trimmed) < 2:
+        return None
+    start = trimmed[0][1]
+    end = trimmed[-1][1]
+    if not start:
+        return None
+    return end / start - 1.0
+
+
 def _month_ago_iso(latest_iso: str) -> str:
     """Rough one-month lookback: 30 days back from the latest bar."""
     from datetime import date, timedelta
@@ -1115,10 +1136,17 @@ def _score_return(sharpe: float | None, alpha: float | None) -> float | None:
     return sum(parts) / len(parts) if parts else None
 
 
-def _score_momentum(one_month: float | None, ytd: float | None, cum: float | None) -> float | None:
-    """Positive recent + longer-term returns score higher. Absolute."""
+def _score_momentum(
+    one_month: float | None, ytd: float | None, twelve_one: float | None
+) -> float | None:
+    """Positive recent + longer-term returns score higher. Absolute.
+
+    Uses the 12-1 return (12M excluding the most recent month) rather than raw
+    12M, which is the standard academic-momentum construction — it excludes the
+    short-term reversal window that adds noise, not signal.
+    """
     parts: list[float] = []
-    for v in (one_month, ytd, cum):
+    for v in (one_month, ytd, twelve_one):
         if isinstance(v, (int, float)):
             parts.append(_clamp01((v + 0.2) * 100 / 0.6))    # -20% → 0, +40% → 100
     return sum(parts) / len(parts) if parts else None
@@ -1208,7 +1236,7 @@ def _coverage(value_basis: dict, quality_basis: dict, factors: dict) -> dict:
     for k in ("sharpe", "alpha"):
         if isinstance(factors.get(k), (int, float)):
             used += 1
-    for k in ("oneMonth", "ytd", "cumulativeReturn"):
+    for k in ("oneMonth", "ytd", "twelveOneMomentum"):
         if isinstance(factors.get(k), (int, float)):
             used += 1
     return {
@@ -1294,6 +1322,7 @@ def screener(
         }
         one_month = None
         ytd = None
+        twelve_one = None
         beta = None
         alpha = None
         if len(closes) >= 2:
@@ -1302,6 +1331,7 @@ def screener(
             latest = closes[-1][0]
             one_month = _range_return(closes, _month_ago_iso(latest))
             ytd = _range_return(closes, _ytd_start_iso(latest))
+            twelve_one = _twelve_one_return(closes)
             if bench_returns_by_date:
                 beta, alpha = _beta_alpha(sym_returns_by_date, bench_returns_by_date)
 
@@ -1334,6 +1364,7 @@ def screener(
             # Momentum
             "oneMonth": one_month,
             "ytd": ytd,
+            "twelveOneMomentum": twelve_one,
             # Analyst
             "targetMean": target,
             "targetUpside": target_upside,
@@ -1345,10 +1376,19 @@ def screener(
             "value": value_score,
             "quality": quality_score,
             "return": _score_return(stats.get("sharpe"), alpha),
-            "momentum": _score_momentum(one_month, ytd, stats.get("cumulativeReturn")),
+            "momentum": _score_momentum(one_month, ytd, twelve_one),
         }
         available = [v for v in scores.values() if isinstance(v, (int, float))]
-        composite = sum(available) / len(available) if available else None
+        raw_composite = sum(available) / len(available) if available else None
+
+        # Coverage-weight the composite so a thin row (few factors present)
+        # can't outrank a well-covered one on the strength of a lucky sample.
+        # sqrt keeps the penalty gentle — full coverage passes through unchanged,
+        # 50% coverage scales to ~0.71x, 25% coverage to 0.5x.
+        cov = _coverage(value_basis, quality_basis, factors)
+        composite = raw_composite
+        if raw_composite is not None and isinstance(cov.get("ratio"), (int, float)):
+            composite = raw_composite * math.sqrt(cov["ratio"])
 
         return {
             "symbol": sym,
@@ -1356,9 +1396,10 @@ def screener(
             "sector": info_row.get("sector"),
             "price": price,
             "compositeScore": composite,
+            "rawCompositeScore": raw_composite,
             "scores": scores,
             "scoring": {"value": value_basis, "quality": quality_basis},
-            "coverage": _coverage(value_basis, quality_basis, factors),
+            "coverage": cov,
             "factors": factors,
             "signals": _signals(factors),
         }

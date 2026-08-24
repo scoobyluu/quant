@@ -201,7 +201,9 @@ skipped, not zeroed):
 - **Value** — forward P/E, PEG, price/book, price/sales, **FCF yield**
 - **Quality** — ROE, profit margin, revenue growth, debt/equity
 - **Return** — 1Y Sharpe and annualized alpha vs SPY
-- **Momentum** — 1M, YTD, and 1Y return
+- **Momentum** — 1M, YTD, and **12-1** (12M return excluding the most recent
+  month, the standard academic-momentum construction — recent-month returns
+  mean-revert, so pure 12M smuggles reversal noise into the signal)
 
 **Value and Quality are scored by sector-relative percentile.** A P/E of 15 is
 cheap for a bank but expensive for software, so scoring every ticker against
@@ -222,6 +224,11 @@ The response includes:
 - `coverage` per row — `{used, total, ratio}` counting how many of the 14
   possible factor inputs were available. Rows below 50% coverage are dimmed
   in the UI since the composite is being averaged over a thin subset.
+- `compositeScore` is **coverage-weighted**: the raw mean of the four bucket
+  scores is multiplied by `sqrt(coverage.ratio)` so a thin row can't outrank
+  a well-covered one on the strength of a small sample. Full coverage passes
+  through unchanged (`sqrt(1.0) = 1.0`); 50% coverage scales to ~0.71x. The
+  un-weighted value is also returned as `rawCompositeScore`.
 
 Signals emitted per row:
 
