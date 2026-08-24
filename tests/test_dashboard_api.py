@@ -28,6 +28,19 @@ class DashboardApiTests(unittest.TestCase):
             "AAPL", [20, 50], "adjusted", False
         )
 
+    @patch("quant.dashboard.server._research_service")
+    def test_research_routes_delegate_to_provider(self, service) -> None:
+        service.quote.return_value = {"symbol": "AAPL", "price": 125.0}
+        service.history.return_value = {"symbol": "AAPL", "candles": []}
+
+        quote = server.quote("aapl")
+        history = server.history("AAPL", "1mo", "1d")
+
+        self.assertEqual(quote["price"], 125.0)
+        self.assertEqual(history["candles"], [])
+        service.quote.assert_called_once_with("aapl")
+        service.history.assert_called_once_with("AAPL", "1mo", "1d")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -13,10 +13,10 @@ from quant.market_analysis import (
 from quant.market_data import get_sp500_market_history, latest_market_snapshot
 from quant.portfolio import (
     DEFAULT_PORTFOLIO_MARKET_DATA_PATH,
-    DEFAULT_PORTFOLIO_PATH,
-    analyze_portfolio_file,
+    analyze_positions,
 )
 from quant.storage import DEFAULT_MARKET_DATA_PATH, load_market_data, save_market_data
+from quant.user_data import DEFAULT_USER_DATA_PATH, UserDataRepository
 
 GREEN = "\033[32m"
 RED = "\033[31m"
@@ -49,13 +49,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     index.set_defaults(handler=_run_index)
 
-    portfolio = commands.add_parser("portfolio", help="analyze a portfolio CSV")
+    portfolio = commands.add_parser("portfolio", help="analyze the stored portfolio")
     _add_refresh(portfolio)
     portfolio.add_argument(
-        "--file",
+        "--database",
         type=Path,
-        default=DEFAULT_PORTFOLIO_PATH,
-        help="portfolio CSV path",
+        default=DEFAULT_USER_DATA_PATH,
+        help="SQLite portfolio database path",
     )
     portfolio.add_argument(
         "--cache",
@@ -146,12 +146,12 @@ def _run_index(args: argparse.Namespace) -> None:
 
 
 def _run_portfolio(args: argparse.Namespace) -> None:
-    analysis = analyze_portfolio_file(
-        args.file,
-        args.index_cache,
-        args.cache,
-        args.refresh,
-    )
+    repository = UserDataRepository(args.database)
+    positions = repository.positions_frame()
+    if positions.is_empty():
+        print("Portfolio is empty")
+        return
+    analysis = analyze_positions(positions, args.index_cache, args.cache, args.refresh)
     summary = summarize_portfolio(analysis).row(0, named=True)
     total_return = summary["Gain/Loss %"]
     formatted_return = (

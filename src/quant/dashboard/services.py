@@ -4,11 +4,11 @@ from pathlib import Path
 
 import polars as pl
 
-from quant.analysis import analyze_portfolio, summarize_allocation, summarize_portfolio
+from quant.analysis import summarize_allocation, summarize_portfolio
 from quant.market_analysis import DEFAULT_MARKET_ANALYSIS_PATH, analyze_symbols
 from quant.portfolio import (
     DEFAULT_PORTFOLIO_MARKET_DATA_PATH,
-    load_portfolio_market_data,
+    analyze_positions,
 )
 from quant.storage import DEFAULT_MARKET_DATA_PATH
 from quant.user_data import UserDataRepository
@@ -37,8 +37,8 @@ class DashboardService:
         return self.repository.remove_watchlist(symbol)
 
     def holdings(self, refresh: bool = False) -> dict:
-        positions = self.repository.list_positions()
-        if not positions:
+        frame = self.repository.positions_frame()
+        if frame.is_empty():
             return {
                 "holdings": [],
                 "totals": {
@@ -54,25 +54,12 @@ class DashboardService:
                 },
             }
 
-        frame = pl.DataFrame(
-            {
-                "ID": [position["id"] for position in positions],
-                "Symbol": [position["symbol"] for position in positions],
-                "Quantity": [position["quantity"] for position in positions],
-                "Average Cost": [position["average_cost"] for position in positions],
-                "Account": [position["account"] for position in positions],
-                "Asset Class": [position["asset_class"] for position in positions],
-                "Sector": [position["sector"] for position in positions],
-                "Acquired": [position["acquired"] for position in positions],
-            }
-        )
-        market_data = load_portfolio_market_data(
-            frame.get_column("Symbol").unique(maintain_order=True).to_list(),
+        analysis = analyze_positions(
+            frame,
             self.index_cache_path,
             self.portfolio_cache_path,
             refresh,
         )
-        analysis = analyze_portfolio(frame, market_data)
         summary = summarize_portfolio(analysis).row(0, named=True)
         holdings = [self._holding_response(row) for row in analysis.to_dicts()]
         return {
