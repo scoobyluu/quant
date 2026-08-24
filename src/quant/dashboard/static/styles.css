@@ -231,6 +231,27 @@ a:hover { text-decoration: underline; }
 .pill.up { background: #0f2b1b; color: var(--up); }
 .pill.down { background: #2b0f0f; color: var(--down); }
 
+.pill.signal {
+  font-size: 11px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+}
+.pill.signal-value,
+.pill.signal-cheap,
+.pill.signal-fcfy\+,
+.pill.signal-quality { border-color: var(--up); color: var(--up); background: #0f2b1b; }
+.pill.signal-growth,
+.pill.signal-momentum { border-color: var(--accent); color: var(--accent); background: #10203a; }
+.pill.signal-sharpe\+,
+.pill.signal-alpha\+ { border-color: #f59e0b; color: #f59e0b; background: #2a1c05; }
+.pill.signal-upside { border-color: #a78bfa; color: #a78bfa; background: #201533; }
+.pill.signal-trap { border-color: var(--down); color: var(--down); background: #2b0f0f; }
+
+tr.low-coverage td { opacity: 0.55; }
+tr.low-coverage:hover td { opacity: 0.85; }
+
 .scroll-y { max-height: 360px; overflow-y: auto; }
 
 .market-strip {
