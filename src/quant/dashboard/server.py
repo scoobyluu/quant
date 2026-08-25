@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import csv
-import json
 import math
-import time
-import uuid
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -13,17 +10,14 @@ import yfinance as yf
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-try:
-    from curl_cffi import requests as curl_requests  # type: ignore
+from quant.dashboard.research import YahooResearchService, clean_json
+from quant.dashboard.services import DashboardService
 
-    _SESSION = curl_requests.Session(impersonate="chrome")
-except Exception:
-    _SESSION = None
 
 app = FastAPI(title="Quant Dashboard API")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
@@ -32,116 +26,50 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+_dashboard_service = DashboardService()
+_research_service = YahooResearchService()
 
-DATA_DIR = Path(__file__).parent / "data"
-DATA_DIR.mkdir(exist_ok=True)
-HOLDINGS_FILE = DATA_DIR / "holdings.json"
-WATCHLIST_FILE = DATA_DIR / "watchlist.json"
-
-# portfolio.csv lives at the repo root and follows: ticker,quantity,cost
-PORTFOLIO_CSV = Path(__file__).resolve().parents[3] / "portfolio.csv"
-
-DEFAULT_WATCHLIST = ["AAPL", "MSFT", "NVDA", "GOOGL", "TSLA"]
-
-_cache: dict[str, tuple[float, Any]] = {}
-CACHE_TTL_SECONDS = 30
-NEWS_TTL_SECONDS = 60 * 5  # news changes slower than quotes; cache longer
-NAME_TTL_SECONDS = 60 * 60 * 24  # company names effectively never change
-STALE_TTL_SECONDS = 60 * 60
-ANALYTICS_TTL_SECONDS = 60 * 15  # returns-based analytics are heavy; refresh every 15m
+ANALYTICS_TTL_SECONDS = 60 * 15
 TRADING_DAYS = 252
 BENCHMARK_SYMBOL = "SPY"
 
 
-def _load_json(path: Path, default: Any) -> Any:
-    if not path.exists():
-        return default
+class WatchlistAdd(BaseModel):
+    symbol: str
+
+
+class HoldingIn(BaseModel):
+    symbol: str
+    shares: float
+    costBasis: float
+    account: str | None = None
+    assetClass: str | None = None
+    sector: str | None = None
+    acquired: str | None = None
+
+
+def _research(producer: Callable[[], dict]) -> dict:
     try:
-        return json.loads(path.read_text())
-    except json.JSONDecodeError:
-        return default
-
-
-def _save_json(path: Path, value: Any) -> None:
-    path.write_text(json.dumps(value, indent=2, default=str))
-
-
-def _seed_holdings_from_csv() -> list[dict]:
-    """One-time seed: convert portfolio.csv (ticker,quantity,cost) into holdings.json."""
-    if not PORTFOLIO_CSV.exists():
-        return []
-    seeded: list[dict] = []
-    with PORTFOLIO_CSV.open() as f:
-        for row in csv.DictReader(f):
-            symbol = (row.get("ticker") or "").strip().upper()
-            if not symbol:
-                continue
-            try:
-                shares = float(row.get("quantity") or 0)
-                cost = float(row.get("cost") or 0)
-            except ValueError:
-                continue
-            seeded.append(
-                {
-                    "id": str(uuid.uuid4()),
-                    "symbol": symbol,
-                    "shares": shares,
-                    "costBasis": cost,
-                }
-            )
-    if seeded:
-        _save_json(HOLDINGS_FILE, seeded)
-    return seeded
-
-
-if not HOLDINGS_FILE.exists():
-    _seed_holdings_from_csv()
-
-
-def _cached(key: str, producer, ttl: int = CACHE_TTL_SECONDS):
-    """Return fresh value if cached < ttl; otherwise call producer.
-
-    On producer failure, fall back to a stale cached value (<= STALE_TTL) so a
-    transient upstream 429 doesn't blank the UI.
-    """
-    now = time.time()
-    hit = _cache.get(key)
-    if hit and now - hit[0] < ttl:
-        return hit[1]
-    try:
-        value = producer()
-    except Exception:
-        if hit and now - hit[0] < STALE_TTL_SECONDS:
-            return hit[1]
-        raise
-    _cache[key] = (now, value)
-    return value
-
-
-def _clean(value: Any) -> Any:
-    """Recursively make a value JSON-safe: drop NaN/Inf, stringify weird types."""
-    if value is None:
-        return None
-    if isinstance(value, float):
-        if math.isnan(value) or math.isinf(value):
-            return None
-        return value
-    if isinstance(value, (int, str, bool)):
-        return value
-    if isinstance(value, dict):
-        return {str(k): _clean(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_clean(v) for v in value]
-    try:
-        return str(value)
-    except Exception:
-        return None
+        return producer()
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=f"yfinance error: {error}") from error
 
 
 def _ticker(symbol: str) -> yf.Ticker:
-    if _SESSION is not None:
-        return yf.Ticker(symbol.upper(), session=_SESSION)
-    return yf.Ticker(symbol.upper())
+    return _research_service._ticker(symbol.upper())
+
+
+def _holdings_raw() -> list[dict]:
+    """Positions from the shared repository, shaped for analytics helpers."""
+    return [
+        {
+            "id": row["id"],
+            "symbol": row["symbol"].upper(),
+            "shares": float(row["quantity"]),
+            "costBasis": float(row["average_cost"]),
+        }
+        for row in _dashboard_service.repository.list_positions()
+    ]
 
 
 @app.get("/favicon.ico")
@@ -156,479 +84,105 @@ def health() -> dict:
 
 @app.get("/api/quotes")
 def quotes(symbols: str = Query(..., description="Comma-separated symbols")) -> dict:
-    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
-    syms = syms[:20]
-    if not syms:
+    """Batched quote fetch, parallelized so 20 symbols don't block serially."""
+    parsed = [symbol.strip().upper() for symbol in symbols.split(",") if symbol.strip()][:20]
+    if not parsed:
         return {"quotes": []}
 
     def fetch(sym: str) -> dict:
         try:
-            return quote(sym)
-        except HTTPException:
+            return _research_service.quote(sym)
+        except Exception:
             return {"symbol": sym, "error": True}
 
-    with ThreadPoolExecutor(max_workers=min(len(syms), 10)) as ex:
-        results = list(ex.map(fetch, syms))
+    with ThreadPoolExecutor(max_workers=min(len(parsed), 10)) as ex:
+        results = list(ex.map(fetch, parsed))
     return {"quotes": results}
-
-
-def _fi_get(fi: Any, *keys: str) -> Any:
-    """Read a field from a yfinance FastInfo (supports attr and dict access)."""
-    for k in keys:
-        try:
-            if hasattr(fi, k):
-                v = getattr(fi, k)
-                if v is not None:
-                    return v
-            if hasattr(fi, "get"):
-                v = fi.get(k)
-                if v is not None:
-                    return v
-        except Exception:
-            pass
-    return None
-
-
-def _name(symbol: str) -> str | None:
-    """Long-cached company name. Falls back to None on failure."""
-    def produce() -> str | None:
-        info = _ticker(symbol).info or {}
-        return info.get("shortName") or info.get("longName")
-
-    try:
-        return _cached(f"name:{symbol.upper()}", produce, ttl=NAME_TTL_SECONDS)
-    except Exception:
-        return None
 
 
 @app.get("/api/quote/{symbol}")
 def quote(symbol: str) -> dict:
-    def produce() -> dict:
-        t = _ticker(symbol)
-
-        # Fetch fast_info and the (long-cached) name in parallel so cold requests
-        # aren't gated by the name lookup.
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            fi_fut = ex.submit(lambda: t.fast_info)
-            name_fut = ex.submit(_name, symbol)
-            try:
-                fi = fi_fut.result()
-            except Exception:
-                fi = None
-            name = name_fut.result()
-
-        price = _fi_get(fi, "last_price", "lastPrice", "regular_market_price")
-        prev = _fi_get(fi, "previous_close", "regular_market_previous_close")
-        day_high = _fi_get(fi, "day_high", "dayHigh")
-        day_low = _fi_get(fi, "day_low", "dayLow")
-        volume = _fi_get(fi, "last_volume", "regular_market_volume", "volume")
-        currency = _fi_get(fi, "currency")
-
-        # fast_info doesn't expose marketState; if we need to backfill any missing
-        # volatile field, fall back to the slower .info path once.
-        if price is None:
-            info = t.info or {}
-            price = (
-                info.get("regularMarketPrice")
-                or info.get("currentPrice")
-                or info.get("previousClose")
-            )
-            prev = prev or info.get("regularMarketPreviousClose") or info.get("previousClose")
-            day_high = day_high or info.get("dayHigh")
-            day_low = day_low or info.get("dayLow")
-            volume = volume or info.get("volume") or info.get("regularMarketVolume")
-            currency = currency or info.get("currency")
-
-        change = None
-        change_pct = None
-        if price is not None and prev:
-            change = price - prev
-            change_pct = (change / prev) * 100 if prev else None
-        return _clean(
-            {
-                "symbol": symbol.upper(),
-                "name": name,
-                "price": price,
-                "previousClose": prev,
-                "change": change,
-                "changePercent": change_pct,
-                "currency": currency,
-                "marketState": None,
-                "dayHigh": day_high,
-                "dayLow": day_low,
-                "volume": volume,
-            }
-        )
-
-    try:
-        return _cached(f"quote:{symbol.upper()}", produce)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"yfinance error: {e}")
+    return _research(lambda: _research_service.quote(symbol))
 
 
 @app.get("/api/history/{symbol}")
 def history(
     symbol: str,
-    period: str = Query("1mo", description="1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max"),
-    interval: str = Query("1d", description="1m,5m,15m,30m,1h,1d,1wk,1mo"),
+    period: str = Query("1mo"),
+    interval: str = Query("1d"),
 ) -> dict:
-    def produce() -> dict:
-        df = _ticker(symbol).history(period=period, interval=interval, auto_adjust=False)
-        if df.empty:
-            return {"symbol": symbol.upper(), "period": period, "interval": interval, "candles": []}
-        df = df.reset_index()
-        date_col = "Datetime" if "Datetime" in df.columns else "Date"
-        candles = []
-        for _, row in df.iterrows():
-            candles.append(
-                {
-                    "t": row[date_col].isoformat() if hasattr(row[date_col], "isoformat") else str(row[date_col]),
-                    "open": row.get("Open"),
-                    "high": row.get("High"),
-                    "low": row.get("Low"),
-                    "close": row.get("Close"),
-                    "volume": row.get("Volume"),
-                }
-            )
-        return _clean(
-            {
-                "symbol": symbol.upper(),
-                "period": period,
-                "interval": interval,
-                "candles": candles,
-            }
-        )
-
-    try:
-        return _cached(f"hist:{symbol.upper()}:{period}:{interval}", produce)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"yfinance error: {e}")
+    return _research(lambda: _research_service.history(symbol, period, interval))
 
 
 @app.get("/api/info/{symbol}")
 def info(symbol: str) -> dict:
-    def produce() -> dict:
-        raw = _ticker(symbol).info or {}
-        keys = [
-            "shortName", "longName", "symbol", "sector", "industry", "country", "website",
-            "longBusinessSummary", "fullTimeEmployees",
-            "marketCap", "enterpriseValue",
-            "trailingPE", "forwardPE", "pegRatio", "priceToBook", "priceToSalesTrailing12Months",
-            "trailingEps", "forwardEps",
-            "dividendRate", "dividendYield", "payoutRatio", "fiveYearAvgDividendYield",
-            "beta", "52WeekChange", "fiftyTwoWeekHigh", "fiftyTwoWeekLow",
-            "fiftyDayAverage", "twoHundredDayAverage",
-            "profitMargins", "operatingMargins", "grossMargins", "ebitdaMargins",
-            "returnOnAssets", "returnOnEquity",
-            "totalRevenue", "revenuePerShare", "revenueGrowth", "earningsGrowth",
-            "grossProfits", "ebitda", "netIncomeToCommon",
-            "totalCash", "totalDebt", "debtToEquity", "currentRatio", "quickRatio",
-            "freeCashflow", "operatingCashflow",
-            "sharesOutstanding", "floatShares", "heldPercentInsiders", "heldPercentInstitutions",
-            "averageVolume", "averageVolume10days",
-            "currentPrice", "regularMarketPrice",
-            "targetMeanPrice", "targetHighPrice", "targetLowPrice", "targetMedianPrice",
-            "recommendationKey", "recommendationMean", "numberOfAnalystOpinions",
-        ]
-        subset = {k: raw.get(k) for k in keys}
-        return _clean(subset)
-
-    try:
-        return _cached(f"info:{symbol.upper()}", produce)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"yfinance error: {e}")
+    return _research(lambda: _research_service.info(symbol))
 
 
 @app.get("/api/analyst/{symbol}")
 def analyst(symbol: str) -> dict:
-    def produce() -> dict:
-        t = _ticker(symbol)
-        out: dict[str, Any] = {"symbol": symbol.upper()}
-
-        raw = t.info or {}
-        out["recommendationKey"] = raw.get("recommendationKey")
-        out["recommendationMean"] = raw.get("recommendationMean")
-        out["numberOfAnalystOpinions"] = raw.get("numberOfAnalystOpinions")
-        out["targetHigh"] = raw.get("targetHighPrice")
-        out["targetLow"] = raw.get("targetLowPrice")
-        out["targetMean"] = raw.get("targetMeanPrice")
-        out["targetMedian"] = raw.get("targetMedianPrice")
-
-        try:
-            rec = t.recommendations
-            if rec is not None and not rec.empty:
-                recent = rec.tail(25).reset_index()
-                out["recommendations"] = [
-                    {str(k): v for k, v in row.items()}
-                    for _, row in recent.iterrows()
-                ]
-        except Exception:
-            out["recommendations"] = []
-
-        try:
-            ug = t.upgrades_downgrades
-            if ug is not None and not ug.empty:
-                ug = ug.head(25).reset_index()
-                out["upgradesDowngrades"] = [
-                    {str(k): v for k, v in row.items()}
-                    for _, row in ug.iterrows()
-                ]
-        except Exception:
-            out["upgradesDowngrades"] = []
-
-        return _clean(out)
-
-    try:
-        return _cached(f"analyst:{symbol.upper()}", produce)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"yfinance error: {e}")
+    return _research(lambda: _research_service.analyst(symbol))
 
 
 @app.get("/api/earnings/{symbol}")
 def earnings(symbol: str) -> dict:
-    def produce() -> dict:
-        t = _ticker(symbol)
-
-        next_earnings: str | None = None
-        eps_estimate: dict[str, Any] = {}
-        revenue_estimate: dict[str, Any] = {}
-        dividend_date: str | None = None
-        ex_dividend_date: str | None = None
-        try:
-            cal = t.calendar
-            if isinstance(cal, dict):
-                dates = cal.get("Earnings Date")
-                if isinstance(dates, list) and dates:
-                    d = dates[0]
-                    next_earnings = d.isoformat() if hasattr(d, "isoformat") else str(d)
-                for lo_key, hi_key, avg_key, out in (
-                    ("Earnings Low", "Earnings High", "Earnings Average", eps_estimate),
-                    ("Revenue Low", "Revenue High", "Revenue Average", revenue_estimate),
-                ):
-                    out["low"] = cal.get(lo_key)
-                    out["high"] = cal.get(hi_key)
-                    out["average"] = cal.get(avg_key)
-                dd = cal.get("Dividend Date")
-                xd = cal.get("Ex-Dividend Date")
-                dividend_date = dd.isoformat() if hasattr(dd, "isoformat") else (str(dd) if dd else None)
-                ex_dividend_date = xd.isoformat() if hasattr(xd, "isoformat") else (str(xd) if xd else None)
-        except Exception:
-            pass
-
-        history_rows: list[dict] = []
-        try:
-            ed = t.earnings_dates
-            if ed is not None and not ed.empty:
-                df = ed.reset_index()
-                date_col = df.columns[0]
-                for _, row in df.head(12).iterrows():
-                    d = row[date_col]
-                    history_rows.append(
-                        {
-                            "date": d.isoformat() if hasattr(d, "isoformat") else str(d),
-                            "epsEstimate": row.get("EPS Estimate"),
-                            "epsReported": row.get("Reported EPS"),
-                            "surprisePercent": row.get("Surprise(%)"),
-                        }
-                    )
-        except Exception:
-            pass
-
-        return _clean(
-            {
-                "symbol": symbol.upper(),
-                "nextEarnings": next_earnings,
-                "epsEstimate": eps_estimate,
-                "revenueEstimate": revenue_estimate,
-                "dividendDate": dividend_date,
-                "exDividendDate": ex_dividend_date,
-                "history": history_rows,
-            }
-        )
-
-    try:
-        return _cached(f"earn:{symbol.upper()}", produce)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"yfinance error: {e}")
+    return _research(lambda: _research_service.earnings(symbol))
 
 
 @app.get("/api/options/{symbol}")
 def options(symbol: str, expiration: str | None = None) -> dict:
-    def produce() -> dict:
-        t = _ticker(symbol)
-        try:
-            expirations = list(t.options or [])
-        except Exception:
-            expirations = []
-        chosen = expiration or (expirations[0] if expirations else None)
-        calls: list = []
-        puts: list = []
-        if chosen:
-            try:
-                chain = t.option_chain(chosen)
-                calls = chain.calls.to_dict(orient="records") if chain.calls is not None else []
-                puts = chain.puts.to_dict(orient="records") if chain.puts is not None else []
-            except Exception:
-                calls, puts = [], []
-        return _clean(
-            {
-                "symbol": symbol.upper(),
-                "expirations": expirations,
-                "expiration": chosen,
-                "calls": calls,
-                "puts": puts,
-            }
-        )
-
-    try:
-        return _cached(f"opt:{symbol.upper()}:{expiration or ''}", produce)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"yfinance error: {e}")
-
-
-def _pick_thumbnail(thumb: Any) -> str | None:
-    """Pick a small-ish thumbnail URL. Prefer 100-400px wide; fall back to original."""
-    if not isinstance(thumb, dict):
-        return None
-    resolutions = thumb.get("resolutions") or []
-    if isinstance(resolutions, list) and resolutions:
-        candidates = [r for r in resolutions if isinstance(r, dict) and r.get("url")]
-        small = [r for r in candidates if isinstance(r.get("width"), (int, float)) and 100 <= r["width"] <= 400]
-        if small:
-            small.sort(key=lambda r: r["width"])
-            return small[0]["url"]
-        if candidates:
-            return candidates[0]["url"]
-    return thumb.get("originalUrl") or thumb.get("url")
+    return _research(lambda: _research_service.options(symbol, expiration))
 
 
 @app.get("/api/news/{symbol}")
 def news(symbol: str) -> dict:
-    def produce() -> dict:
-        try:
-            items = _ticker(symbol).news or []
-        except Exception:
-            items = []
-        normalized = []
-        for it in items[:25]:
-            content = it.get("content") if isinstance(it, dict) else None
-            if isinstance(content, dict):
-                normalized.append(
-                    {
-                        "title": content.get("title"),
-                        "publisher": (content.get("provider") or {}).get("displayName")
-                        if isinstance(content.get("provider"), dict)
-                        else content.get("publisher"),
-                        "link": (content.get("canonicalUrl") or {}).get("url")
-                        if isinstance(content.get("canonicalUrl"), dict)
-                        else content.get("link"),
-                        "publishedAt": content.get("pubDate") or content.get("displayTime"),
-                        "summary": content.get("summary"),
-                        "thumbnail": _pick_thumbnail(content.get("thumbnail")),
-                    }
-                )
-            elif isinstance(it, dict):
-                thumb = it.get("thumbnail")
-                thumb_url = None
-                if isinstance(thumb, dict):
-                    thumb_url = _pick_thumbnail(thumb)
-                normalized.append(
-                    {
-                        "title": it.get("title"),
-                        "publisher": it.get("publisher"),
-                        "link": it.get("link"),
-                        "publishedAt": it.get("providerPublishTime"),
-                        "summary": it.get("summary"),
-                        "thumbnail": thumb_url,
-                    }
-                )
-        return _clean({"symbol": symbol.upper(), "items": normalized})
-
-    try:
-        return _cached(f"news:{symbol.upper()}", produce, ttl=NEWS_TTL_SECONDS)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"yfinance error: {e}")
+    return _research(lambda: _research_service.news(symbol))
 
 
 @app.get("/api/news")
-def news_feed(symbols: str | None = Query(None, description="Comma-separated symbols; defaults to watchlist")) -> dict:
-    """Aggregated news across a set of symbols (watchlist by default)."""
-    if symbols:
-        syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
-    else:
-        syms = _load_json(WATCHLIST_FILE, DEFAULT_WATCHLIST)
-    syms = syms[:10]
-
-    def produce() -> dict:
-        def fetch(sym: str) -> tuple[str, list[dict]]:
-            try:
-                return sym, (news(sym).get("items") or [])
-            except HTTPException:
-                return sym, []
-
-        merged: list[dict] = []
-        seen: set[str] = set()
-        if syms:
-            with ThreadPoolExecutor(max_workers=min(len(syms), 10)) as ex:
-                # ex.map preserves input order, giving stable de-dup priority.
-                for sym, items in ex.map(fetch, syms):
-                    for it in items:
-                        key = it.get("link") or it.get("title")
-                        if not key or key in seen:
-                            continue
-                        seen.add(key)
-                        merged.append({**it, "symbol": sym})
-
-        def sort_key(item: dict):
-            v = item.get("publishedAt")
-            if isinstance(v, (int, float)):
-                return float(v)
-            if isinstance(v, str):
-                try:
-                    from datetime import datetime
-
-                    return datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
-                except Exception:
-                    return 0.0
-            return 0.0
-
-        merged.sort(key=sort_key, reverse=True)
-        return _clean({"symbols": syms, "items": merged[:30]})
-
-    key = "feed:" + ",".join(syms)
-    try:
-        return _cached(key, produce, ttl=NEWS_TTL_SECONDS)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"yfinance error: {e}")
+def news_feed(
+    symbols: str | None = Query(None, description="Comma-separated symbols"),
+) -> dict:
+    parsed = (
+        [symbol.strip().upper() for symbol in symbols.split(",") if symbol.strip()]
+        if symbols
+        else _dashboard_service.watchlist()
+    )
+    return _research(lambda: _research_service.news_feed(parsed))
 
 
 @app.get("/api/search")
 def search(q: str = Query(..., min_length=1)) -> dict:
-    def produce() -> dict:
-        try:
-            s = yf.Search(q, max_results=10)
-            quotes_ = s.quotes or []
-        except Exception:
-            quotes_ = []
-        results = []
-        for item in quotes_:
-            results.append(
-                {
-                    "symbol": item.get("symbol"),
-                    "name": item.get("shortname") or item.get("longname"),
-                    "exchange": item.get("exchDisp") or item.get("exchange"),
-                    "type": item.get("typeDisp") or item.get("quoteType"),
-                }
-            )
-        return _clean({"query": q, "results": results})
-
-    try:
-        return _cached(f"search:{q}", produce)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"yfinance error: {e}")
+    return _research(lambda: _research_service.search(q))
 
 
 # ---- Analytics ----
+#
+# Risk-adjusted return metrics, computed from daily closes. Uses a small
+# ad-hoc TTL cache so heavy pages (portfolio analytics, screener) don't
+# re-fetch history for every row when panning the UI.
+
+
+_analytics_cache: dict[str, tuple[float, Any]] = {}
+_ANALYTICS_STALE_TTL_SECONDS = 60 * 60
+
+
+def _analytics_cached(key: str, producer: Callable[[], Any]) -> Any:
+    """Fresh if cached < ANALYTICS_TTL; fall back to stale (<= 1h) on failure."""
+    import time
+
+    now = time.time()
+    hit = _analytics_cache.get(key)
+    if hit and now - hit[0] < ANALYTICS_TTL_SECONDS:
+        return hit[1]
+    try:
+        value = producer()
+    except Exception:
+        if hit and now - hit[0] < _ANALYTICS_STALE_TTL_SECONDS:
+            return hit[1]
+        raise
+    _analytics_cache[key] = (now, value)
+    return value
 
 
 def _daily_closes(symbol: str, period: str = "1y") -> list[tuple[str, float]]:
@@ -658,14 +212,13 @@ def _daily_closes(symbol: str, period: str = "1y") -> list[tuple[str, float]]:
             out.append((iso, c))
         return out
 
-    return _cached(f"closes:{symbol.upper()}:{period}", produce, ttl=ANALYTICS_TTL_SECONDS)
+    return _analytics_cached(f"closes:{symbol.upper()}:{period}", produce)
 
 
 def _stats_from_returns(returns: list[float]) -> dict:
     """Sharpe, Sortino, annualized vol, max drawdown, cumulative return.
 
-    Sharpe/Sortino here are excess-over-zero — no risk-free adjustment. That's
-    a common simplification for a dashboard view.
+    Sharpe/Sortino here are excess-over-zero — no risk-free adjustment.
     """
     if not returns:
         return {
@@ -779,10 +332,9 @@ def _contributions(
 ) -> list[dict]:
     """Per-symbol weight, period return, return contribution, risk contribution.
 
-    Risk contribution uses w_i · cov(r_i, r_p) / var(r_p). By construction the
-    contributions sum to 1 (100%), matching the standard variance decomposition.
+    Risk contribution uses w_i · cov(r_i, r_p) / var(r_p). Contributions sum
+    to 1 by construction — the standard variance decomposition.
     """
-    # Sum shares across lots so a multi-lot ticker appears once.
     shares_by_sym: dict[str, float] = {}
     for hd in holdings:
         sym = hd["symbol"].upper()
@@ -849,8 +401,6 @@ def _portfolio_value_series(
     """Daily portfolio market value assuming current shares held throughout."""
     if not holdings:
         return {}
-    # Union of dates, then forward-fill each symbol's close so a missing day
-    # (rare — halts, holidays) doesn't drop the whole portfolio row.
     all_dates: set[str] = set()
     for series in histories.values():
         for date, _ in series:
@@ -906,11 +456,10 @@ def _range_return(closes: list[tuple[str, float]], start_iso: str | None) -> flo
 
 
 def _twelve_one_return(closes: list[tuple[str, float]]) -> float | None:
-    """12-minus-1 momentum: return from the earliest close to the close ~1 month ago.
+    """12-minus-1 momentum: return from earliest close to the close ~1 month ago.
 
-    The most recent month is dropped because short-term returns mean-revert — a
-    well-documented reversal effect that muddies pure 12M momentum. This is the
-    canonical academic-momentum construction.
+    Recent-month returns mean-revert, so pure 12M smuggles reversal noise into
+    the signal. Dropping the last month is the canonical academic construction.
     """
     if len(closes) < 2:
         return None
@@ -927,7 +476,6 @@ def _twelve_one_return(closes: list[tuple[str, float]]) -> float | None:
 
 
 def _month_ago_iso(latest_iso: str) -> str:
-    """Rough one-month lookback: 30 days back from the latest bar."""
     from datetime import date, timedelta
 
     try:
@@ -938,7 +486,6 @@ def _month_ago_iso(latest_iso: str) -> str:
 
 
 def _ytd_start_iso(latest_iso: str) -> str:
-    """Jan 1 of the year of the latest bar (returned as ISO date)."""
     return f"{latest_iso[:4]}-01-01"
 
 
@@ -961,7 +508,7 @@ def symbol_analytics(
         bench = bench_fut.result()
 
     if len(closes) < 2:
-        return _clean(
+        return clean_json(
             {
                 "symbol": symbol.upper(),
                 "period": period,
@@ -981,7 +528,7 @@ def symbol_analytics(
     if bench:
         beta, alpha = _beta_alpha(returns_by_date, _returns_by_date(bench))
 
-    return _clean(
+    return clean_json(
         {
             "symbol": symbol.upper(),
             "period": period,
@@ -999,36 +546,28 @@ def symbol_analytics(
 
 # ---- Screener ----
 #
-# The screener ranks a set of symbols across four factor buckets:
-#   Value      — cheap on forward P/E / PEG / P/B / P/S / FCF yield
-#   Quality    — high ROE, margins, revenue growth, low leverage
-#   Return     — good risk-adjusted return (Sharpe) and market-adjusted alpha
-#   Momentum   — recent 1M / YTD / 1Y returns
+# Ranks a set of symbols across four factor buckets:
+#   Value     — cheap on forward P/E / PEG / P/B / P/S / FCF yield
+#   Quality   — high ROE, margins, revenue growth, low leverage
+#   Return    — Sharpe and market-adjusted alpha vs SPY
+#   Momentum  — 1M / YTD / 12-1 returns
 #
-# Value and Quality are scored by SECTOR-RELATIVE PERCENTILE — a P/E of 15 is
-# cheap for a bank but expensive for software, so scoring each ticker against
-# an absolute PE curve produces nonsense. We fetch a hardcoded set of sector
-# representatives per request (all cached long enough that repeated hits pay
-# nothing) and compute per-sector percentile samples on the fly.
-#
-# Return and Momentum stay on absolute scales — Sharpe > 1 is a market truth,
-# not a sector one.
+# Value and Quality score by SECTOR-RELATIVE PERCENTILE — a P/E of 15 is cheap
+# for a bank, expensive for software. Return/Momentum stay on absolute scales.
 
 
-# Sector representatives: enough coverage per sector (2-5 names) that
-# percentiles are meaningful, small enough that cold fetches finish in seconds.
 SECTOR_UNIVERSE = [
-    "AAPL", "MSFT", "NVDA", "GOOGL", "META", "ORCL",   # Tech + Comm Services
-    "JPM", "BAC", "GS", "MS", "WFC",                   # Financials
-    "JNJ", "UNH", "PFE", "MRK", "ABBV",                # Healthcare
-    "AMZN", "HD", "MCD", "NKE", "SBUX",                # Consumer Discretionary
-    "WMT", "PG", "KO", "PEP", "COST",                  # Consumer Staples
-    "BA", "CAT", "GE", "HON", "UNP",                   # Industrials
-    "XOM", "CVX", "COP", "SLB",                        # Energy
-    "NEE", "SO", "DUK",                                # Utilities
-    "LIN", "FCX", "ECL",                               # Materials
-    "PLD", "AMT", "O",                                 # Real Estate
-    "DIS", "NFLX", "T", "VZ",                          # Communication Services
+    "AAPL", "MSFT", "NVDA", "GOOGL", "META", "ORCL",
+    "JPM", "BAC", "GS", "MS", "WFC",
+    "JNJ", "UNH", "PFE", "MRK", "ABBV",
+    "AMZN", "HD", "MCD", "NKE", "SBUX",
+    "WMT", "PG", "KO", "PEP", "COST",
+    "BA", "CAT", "GE", "HON", "UNP",
+    "XOM", "CVX", "COP", "SLB",
+    "NEE", "SO", "DUK",
+    "LIN", "FCX", "ECL",
+    "PLD", "AMT", "O",
+    "DIS", "NFLX", "T", "VZ",
 ]
 
 
@@ -1036,18 +575,15 @@ def _clamp01(x: float) -> float:
     return max(0.0, min(100.0, x))
 
 
-def _fcf_yield(info: dict) -> float | None:
+def _fcf_yield(info_row: dict) -> float | None:
     """FCF / market cap. Retail-friendly value signal, harder to fake than PE."""
-    fcf = info.get("freeCashflow")
-    mc = info.get("marketCap")
+    fcf = info_row.get("freeCashflow")
+    mc = info_row.get("marketCap")
     if isinstance(fcf, (int, float)) and isinstance(mc, (int, float)) and mc > 0:
         return fcf / mc
     return None
 
 
-# Factor spec: (key, extract, higher_better, absolute_score_fn)
-# The absolute fallback kicks in when we lack ≥3 sector peers to compute a
-# percentile against — mainly for unusual sectors and ETFs.
 VALUE_FACTORS: list[tuple[str, Any, bool, Any]] = [
     ("forwardPE",     lambda i: i.get("forwardPE") or i.get("trailingPE"),
         False, lambda v: _clamp01(100.0 - (v - 10) * 5)),
@@ -1058,7 +594,7 @@ VALUE_FACTORS: list[tuple[str, Any, bool, Any]] = [
     ("priceToSales",  lambda i: i.get("priceToSalesTrailing12Months"),
         False, lambda v: _clamp01(100.0 - (v - 1) * (100 / 9))),
     ("fcfYield",      _fcf_yield,
-        True,  lambda v: _clamp01(v * 100 * 15)),  # 6.67% yield → 100
+        True,  lambda v: _clamp01(v * 100 * 15)),
 ]
 
 QUALITY_FACTORS: list[tuple[str, Any, bool, Any]] = [
@@ -1069,19 +605,17 @@ QUALITY_FACTORS: list[tuple[str, Any, bool, Any]] = [
     ("revenueGrowth", lambda i: i.get("revenueGrowth"),
         True,  lambda v: _clamp01(v * 100 * 3)),
     ("debtToEquity",  lambda i: i.get("debtToEquity"),
-        False, lambda v: _clamp01(100.0 - v * 0.5)),  # yfinance reports % (100 = 1.0x)
+        False, lambda v: _clamp01(100.0 - v * 0.5)),
 ]
 
 
 def _percentile_rank(value: float, samples: list[float]) -> float:
-    """Fraction of samples <= value, in [0, 1]. Empty samples → 0.5 (neutral)."""
     if not samples:
         return 0.5
     return sum(1 for s in samples if s <= value) / len(samples)
 
 
 def _build_sector_stats(infos: list[dict]) -> dict[str, dict[str, list[float]]]:
-    """Group each factor's raw values by sector for percentile lookups."""
     stats: dict[str, dict[str, list[float]]] = {}
     for info_row in infos:
         sector = info_row.get("sector")
@@ -1100,11 +634,7 @@ def _score_bucket(
     factors_spec: list[tuple[str, Any, bool, Any]],
     sector_stats: dict[str, dict[str, list[float]]],
 ) -> tuple[float | None, dict[str, str]]:
-    """Score a factor bucket, preferring sector percentiles over absolute scales.
-
-    Returns (score, basis_by_factor) where basis is "sector" or "absolute" per
-    factor — useful for debugging and for the UI to indicate coverage.
-    """
+    """Score a factor bucket, preferring sector percentiles over absolute scales."""
     parts: list[float] = []
     basis: dict[str, str] = {}
     sector = info_row.get("sector")
@@ -1113,8 +643,6 @@ def _score_bucket(
         if not isinstance(v, (int, float)) or math.isnan(v) or math.isinf(v):
             continue
         samples = (sector_stats.get(sector) or {}).get(key) if sector else None
-        # Need ≥3 samples for the percentile to mean anything (and drop self so
-        # the target isn't scoring against itself).
         peers = [s for s in samples if s != v] if samples else []
         if peers and len(peers) >= 3:
             rank = _percentile_rank(v, peers)
@@ -1127,28 +655,21 @@ def _score_bucket(
 
 
 def _score_return(sharpe: float | None, alpha: float | None) -> float | None:
-    """Sharpe > 1 and positive alpha score higher. Absolute — not sector-relative."""
     parts: list[float] = []
     if isinstance(sharpe, (int, float)):
-        parts.append(_clamp01((sharpe + 1) * 100 / 3))       # -1 → 0, 2 → 100
+        parts.append(_clamp01((sharpe + 1) * 100 / 3))
     if isinstance(alpha, (int, float)):
-        parts.append(_clamp01((alpha + 0.1) * 100 / 0.3))    # -10% → 0, +20% → 100
+        parts.append(_clamp01((alpha + 0.1) * 100 / 0.3))
     return sum(parts) / len(parts) if parts else None
 
 
 def _score_momentum(
     one_month: float | None, ytd: float | None, twelve_one: float | None
 ) -> float | None:
-    """Positive recent + longer-term returns score higher. Absolute.
-
-    Uses the 12-1 return (12M excluding the most recent month) rather than raw
-    12M, which is the standard academic-momentum construction — it excludes the
-    short-term reversal window that adds noise, not signal.
-    """
     parts: list[float] = []
     for v in (one_month, ytd, twelve_one):
         if isinstance(v, (int, float)):
-            parts.append(_clamp01((v + 0.2) * 100 / 0.6))    # -20% → 0, +40% → 100
+            parts.append(_clamp01((v + 0.2) * 100 / 0.6))
     return sum(parts) / len(parts) if parts else None
 
 
@@ -1156,10 +677,7 @@ def _signals(factors: dict) -> list[str]:
     """Boolean flags — the multi-factor case for the stock at a glance.
 
     Value-trap guard: a stock that looks cheap but is shrinking on the top line
-    (revenueGrowth < 0) is more likely a value trap than a bargain. In that case
-    we strip the `value` and `cheap` chips and emit a `trap` warning instead —
-    the underlying factor scores still stand, but the chip stops advertising a
-    signal that the fundamentals contradict.
+    is more likely a value trap. Strip the `value`/`cheap` chips and emit `trap`.
     """
     out: list[str] = []
     fpe = factors.get("forwardPE")
@@ -1214,24 +732,15 @@ def _signals(factors: dict) -> list[str]:
     return out
 
 
-# Total inputs across all four factor buckets. A row lacking data for many of
-# these gets a low coverage score — a hint that the composite isn't reliable.
 _TOTAL_FACTOR_INPUTS = (
     len(VALUE_FACTORS) + len(QUALITY_FACTORS)
     + 2   # return: sharpe, alpha
-    + 3   # momentum: oneMonth, ytd, cumulativeReturn
+    + 3   # momentum: oneMonth, ytd, twelveOneMomentum
 )
 
 
 def _coverage(value_basis: dict, quality_basis: dict, factors: dict) -> dict:
-    """Fraction of the 14 possible factor inputs that were actually available.
-
-    Value/Quality contribute one point per factor that scored (regardless of
-    whether it used the sector or absolute basis — both count). Return and
-    Momentum count their component metrics directly. A coverage below ~0.5
-    means the composite is being averaged over a small subset and shouldn't
-    be trusted at face value.
-    """
+    """Fraction of the 14 possible factor inputs that were actually available."""
     used = len(value_basis) + len(quality_basis)
     for k in ("sharpe", "alpha"):
         if isinstance(factors.get(k), (int, float)):
@@ -1246,6 +755,20 @@ def _coverage(value_basis: dict, quality_basis: dict, factors: dict) -> dict:
     }
 
 
+def _screener_info(symbol: str) -> dict:
+    """Full `.info` for scoring — includes fields (pegRatio, earningsGrowth,
+    targetMeanPrice, marketCap) the research-service `info` endpoint filters out.
+    """
+    def produce() -> dict:
+        raw = _ticker(symbol).info or {}
+        return clean_json(raw)
+
+    try:
+        return _analytics_cached(f"screener-info:{symbol.upper()}", produce)
+    except Exception:
+        return {}
+
+
 @app.get("/api/screener")
 def screener(
     symbols: str | None = Query(
@@ -1255,39 +778,27 @@ def screener(
 ) -> dict:
     """Multi-factor screener: composite score + signal chips per symbol.
 
-    Combines fundamentals from `.info` with 1Y risk-adjusted return metrics
-    computed against SPY. Value and Quality are scored against SECTOR
-    PERCENTILES (using a hardcoded universe of sector representatives) so a
-    bank's PE isn't compared to software's PE. Return and Momentum stay on
-    absolute scales. Ranks by composite score (mean of available factor
-    scores).
+    Value and Quality score against sector percentiles (hardcoded universe of
+    ~45 sector reps). Return/Momentum use absolute scales. Composite is
+    coverage-weighted so thin rows can't outrank well-covered ones.
     """
     if symbols:
         syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
     else:
-        wl: list[str] = _load_json(WATCHLIST_FILE, DEFAULT_WATCHLIST)
-        holdings_syms = list({h["symbol"].upper() for h in _load_json(HOLDINGS_FILE, [])})
+        wl = _dashboard_service.watchlist()
+        holdings_syms = list({h["symbol"] for h in _holdings_raw()})
         syms = sorted(set(wl) | set(holdings_syms))
     syms = syms[:30]
     if not syms:
         return {"rows": [], "benchmark": BENCHMARK_SYMBOL, "period": "1y"}
 
-    # Fetch info for the user's tickers + hardcoded sector reps in parallel.
-    # info() is cached, so warm requests skip everything but the compute stage.
     universe = sorted(set(syms) | set(SECTOR_UNIVERSE))
 
-    def fetch_info(sym: str) -> dict:
-        try:
-            return info(sym)
-        except HTTPException:
-            return {}
-
     with ThreadPoolExecutor(max_workers=min(len(universe), 12)) as ex:
-        info_by_sym = dict(zip(universe, ex.map(fetch_info, universe)))
+        info_by_sym = dict(zip(universe, ex.map(_screener_info, universe)))
 
     sector_stats = _build_sector_stats(list(info_by_sym.values()))
 
-    # Shared benchmark for alpha/beta — one fetch spans every row.
     try:
         bench_closes = _daily_closes(BENCHMARK_SYMBOL, "1y")
     except Exception:
@@ -1339,7 +850,6 @@ def screener(
         quality_score, quality_basis = _score_bucket(info_row, QUALITY_FACTORS, sector_stats)
 
         factors = {
-            # Value
             "forwardPE": info_row.get("forwardPE"),
             "trailingPE": info_row.get("trailingPE"),
             "pegRatio": info_row.get("pegRatio"),
@@ -1347,13 +857,11 @@ def screener(
             "priceToSales": info_row.get("priceToSalesTrailing12Months"),
             "fcfYield": _fcf_yield(info_row),
             "dividendYield": info_row.get("dividendYield"),
-            # Quality
             "roe": info_row.get("returnOnEquity"),
             "profitMargin": info_row.get("profitMargins"),
             "revenueGrowth": info_row.get("revenueGrowth"),
             "earningsGrowth": info_row.get("earningsGrowth"),
             "debtToEquity": info_row.get("debtToEquity"),
-            # Return
             "sharpe": stats.get("sharpe"),
             "sortino": stats.get("sortino"),
             "volatility": stats.get("volatility"),
@@ -1361,11 +869,9 @@ def screener(
             "cumulativeReturn": stats.get("cumulativeReturn"),
             "alpha": alpha,
             "beta": beta,
-            # Momentum
             "oneMonth": one_month,
             "ytd": ytd,
             "twelveOneMomentum": twelve_one,
-            # Analyst
             "targetMean": target,
             "targetUpside": target_upside,
             "recommendationMean": info_row.get("recommendationMean"),
@@ -1381,10 +887,8 @@ def screener(
         available = [v for v in scores.values() if isinstance(v, (int, float))]
         raw_composite = sum(available) / len(available) if available else None
 
-        # Coverage-weight the composite so a thin row (few factors present)
-        # can't outrank a well-covered one on the strength of a lucky sample.
-        # sqrt keeps the penalty gentle — full coverage passes through unchanged,
-        # 50% coverage scales to ~0.71x, 25% coverage to 0.5x.
+        # sqrt keeps the coverage penalty gentle — full coverage passes through,
+        # 50% scales to ~0.71x, 25% to 0.5x.
         cov = _coverage(value_basis, quality_basis, factors)
         composite = raw_composite
         if raw_composite is not None and isinstance(cov.get("ratio"), (int, float)):
@@ -1408,11 +912,9 @@ def screener(
         rows = list(ex.map(compute, syms))
     rows.sort(key=lambda r: r.get("compositeScore") or 0.0, reverse=True)
 
-    # Report peer-count coverage per sector so the UI (and curl users) know how
-    # much percentile scoring actually kicked in vs. absolute fallback.
     peers_by_sector = {sec: {k: len(v) for k, v in bucket.items()} for sec, bucket in sector_stats.items()}
 
-    return _clean(
+    return clean_json(
         {
             "benchmark": BENCHMARK_SYMBOL,
             "period": "1y",
@@ -1422,29 +924,25 @@ def screener(
     )
 
 
-# ---- Watchlist ----
-
-
-class WatchlistAdd(BaseModel):
-    symbol: str
+# ---- Watchlist / holdings ----
 
 
 @app.get("/api/watchlist")
 def watchlist_get() -> dict:
-    return {"symbols": _load_json(WATCHLIST_FILE, DEFAULT_WATCHLIST)}
+    return {"symbols": _dashboard_service.watchlist()}
 
 
 @app.get("/api/watchlist/quotes")
 def watchlist_quotes() -> dict:
-    """Latest quotes for every symbol in the watchlist, fetched in parallel."""
-    syms: list[str] = _load_json(WATCHLIST_FILE, DEFAULT_WATCHLIST)
+    """Latest quotes for every symbol in the watchlist, parallelized."""
+    syms = _dashboard_service.watchlist()
     if not syms:
         return {"symbols": [], "quotes": []}
 
     def fetch(sym: str) -> dict:
         try:
-            return quote(sym)
-        except HTTPException:
+            return _research_service.quote(sym)
+        except Exception:
             return {"symbol": sym, "error": True}
 
     with ThreadPoolExecutor(max_workers=min(len(syms), 10)) as ex:
@@ -1455,7 +953,7 @@ def watchlist_quotes() -> dict:
 @app.get("/api/watchlist/analytics")
 def watchlist_analytics() -> dict:
     """Per-symbol 1M return, YTD return, 1Y Sharpe and 1Y annualized vol."""
-    syms: list[str] = _load_json(WATCHLIST_FILE, DEFAULT_WATCHLIST)
+    syms = _dashboard_service.watchlist()
     if not syms:
         return {"symbols": [], "metrics": []}
 
@@ -1481,112 +979,40 @@ def watchlist_analytics() -> dict:
 
     with ThreadPoolExecutor(max_workers=min(len(syms), 10)) as ex:
         metrics = list(ex.map(compute, syms))
-    return _clean({"symbols": syms, "metrics": metrics})
+    return clean_json({"symbols": syms, "metrics": metrics})
 
 
 @app.post("/api/watchlist")
 def watchlist_add(body: WatchlistAdd) -> dict:
-    symbols: list[str] = _load_json(WATCHLIST_FILE, DEFAULT_WATCHLIST)
-    sym = body.symbol.upper().strip()
-    if sym and sym not in symbols:
-        symbols.append(sym)
-        _save_json(WATCHLIST_FILE, symbols)
-    return {"symbols": symbols}
+    try:
+        return {"symbols": _dashboard_service.add_watchlist(body.symbol)}
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
 
 
 @app.delete("/api/watchlist/{symbol}")
 def watchlist_remove(symbol: str) -> dict:
-    symbols: list[str] = _load_json(WATCHLIST_FILE, DEFAULT_WATCHLIST)
-    sym = symbol.upper()
-    symbols = [s for s in symbols if s != sym]
-    _save_json(WATCHLIST_FILE, symbols)
-    return {"symbols": symbols}
-
-
-# ---- Holdings ----
-
-
-class HoldingIn(BaseModel):
-    symbol: str
-    shares: float
-    costBasis: float  # per-share cost
-
-
-class Holding(HoldingIn):
-    id: str
+    return {"symbols": _dashboard_service.remove_watchlist(symbol)}
 
 
 @app.get("/api/holdings")
-def holdings_list() -> dict:
-    raw: list[dict] = _load_json(HOLDINGS_FILE, [])
-    enriched = []
-    total_cost = 0.0
-    total_value = 0.0
-
-    # De-dup symbols so we only hit yfinance once per ticker even if the user
-    # holds it across multiple lots.
-    unique_syms = list({h["symbol"].upper() for h in raw})
-
-    def fetch_price(sym: str) -> tuple[str, float | None]:
-        try:
-            return sym, quote(sym).get("price")
-        except HTTPException:
-            return sym, None
-
-    prices: dict[str, float | None] = {}
-    if unique_syms:
-        with ThreadPoolExecutor(max_workers=min(len(unique_syms), 10)) as ex:
-            for sym, price in ex.map(fetch_price, unique_syms):
-                prices[sym] = price
-
-    for h in raw:
-        sym = h["symbol"].upper()
-        price = prices.get(sym)
-        shares = float(h["shares"])
-        cost = float(h["costBasis"])
-        market_value = price * shares if price is not None else None
-        cost_value = cost * shares
-        gain = (market_value - cost_value) if market_value is not None else None
-        gain_pct = (gain / cost_value * 100) if (gain is not None and cost_value) else None
-        if market_value is not None:
-            total_value += market_value
-        total_cost += cost_value
-        enriched.append(
-            {
-                "id": h["id"],
-                "symbol": sym,
-                "shares": shares,
-                "costBasis": cost,
-                "price": price,
-                "marketValue": market_value,
-                "costValue": cost_value,
-                "gain": gain,
-                "gainPercent": gain_pct,
-            }
-        )
-    total_gain = total_value - total_cost if total_value else None
-    total_gain_pct = (total_gain / total_cost * 100) if (total_gain is not None and total_cost) else None
-    return _clean(
-        {
-            "holdings": enriched,
-            "totals": {
-                "cost": total_cost,
-                "value": total_value,
-                "gain": total_gain,
-                "gainPercent": total_gain_pct,
-            },
-        }
-    )
+def holdings_list(refresh: bool = False) -> dict:
+    try:
+        return clean_json(_dashboard_service.holdings(refresh))
+    except (RuntimeError, ValueError) as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
 
 
 @app.get("/api/portfolio/analytics")
-def portfolio_analytics(period: str = Query("1y", description="1mo,3mo,6mo,1y,2y,5y,10y,ytd,max")) -> dict:
+def portfolio_analytics(
+    period: str = Query("1y", description="1mo,3mo,6mo,1y,2y,5y,10y,ytd,max"),
+) -> dict:
     """Risk-adjusted return metrics + cumulative-return curve vs SPY.
 
-    Assumes the user's current shares were held throughout `period` — a
-    standard backtest simplification, not an accurate historical P&L.
+    Assumes current shares held throughout `period` — a standard dashboard
+    simplification, not an accurate historical P&L.
     """
-    raw: list[dict] = _load_json(HOLDINGS_FILE, [])
+    raw = _holdings_raw()
     if not raw:
         return {
             "period": period,
@@ -1595,7 +1021,7 @@ def portfolio_analytics(period: str = Query("1y", description="1mo,3mo,6mo,1y,2y
             "curve": [],
         }
 
-    unique_syms = list({h["symbol"].upper() for h in raw})
+    unique_syms = list({h["symbol"] for h in raw})
     fetch_syms = unique_syms + [BENCHMARK_SYMBOL]
 
     def fetch(sym: str) -> tuple[str, list[tuple[str, float]]]:
@@ -1630,8 +1056,6 @@ def portfolio_analytics(period: str = Query("1y", description="1mo,3mo,6mo,1y,2y
     port_stats = _stats_from_returns(port_returns_seq)
     beta, alpha = _beta_alpha(port_returns_by_date, bench_returns_by_date)
 
-    # Cumulative return curve, aligned on the intersection of portfolio and
-    # benchmark dates so the two series start at 0 on the same day.
     common = sorted(set(dates) & set(bench_by_date_close.keys()))
     curve: list[dict] = []
     if len(common) >= 2:
@@ -1656,7 +1080,6 @@ def portfolio_analytics(period: str = Query("1y", description="1mo,3mo,6mo,1y,2y
         "benchmarkReturn": bench_return,
     }
 
-    # Correlation matrix includes the benchmark for a visual anchor row/col.
     returns_by_symbol: dict[str, dict[str, float]] = {
         sym: _returns_by_date(series) for sym, series in histories.items() if series
     }
@@ -1669,7 +1092,7 @@ def portfolio_analytics(period: str = Query("1y", description="1mo,3mo,6mo,1y,2y
         raw, histories, returns_by_symbol, port_returns_by_date
     )
 
-    return _clean(
+    return clean_json(
         {
             "period": period,
             "benchmark": BENCHMARK_SYMBOL,
@@ -1683,29 +1106,48 @@ def portfolio_analytics(period: str = Query("1y", description="1mo,3mo,6mo,1y,2y
 
 @app.post("/api/holdings")
 def holdings_add(body: HoldingIn) -> dict:
-    raw: list[dict] = _load_json(HOLDINGS_FILE, [])
-    holding = {
-        "id": str(uuid.uuid4()),
-        "symbol": body.symbol.upper().strip(),
-        "shares": body.shares,
-        "costBasis": body.costBasis,
-    }
-    raw.append(holding)
-    _save_json(HOLDINGS_FILE, raw)
-    return holding
+    try:
+        return _dashboard_service.add_holding(
+            body.symbol,
+            body.shares,
+            body.costBasis,
+            body.account,
+            body.assetClass,
+            body.sector,
+            body.acquired,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
 
 
 @app.delete("/api/holdings/{holding_id}")
 def holdings_remove(holding_id: str) -> dict:
-    raw: list[dict] = _load_json(HOLDINGS_FILE, [])
-    new_raw = [h for h in raw if h["id"] != holding_id]
-    _save_json(HOLDINGS_FILE, new_raw)
-    return {"removed": len(raw) - len(new_raw)}
+    return {"removed": int(_dashboard_service.remove_holding(holding_id))}
 
 
-# ---- Static frontend ----
-# Mount LAST so /api/* and /favicon.ico routes take precedence.
-from fastapi.staticfiles import StaticFiles  # noqa: E402
+@app.get("/api/analysis/{symbol}")
+def technical_analysis(
+    symbol: str,
+    windows: str = Query(..., description="Comma-separated trading sessions"),
+    price: str = Query(..., pattern="^(close|adjusted)$"),
+    refresh: bool = False,
+) -> dict:
+    try:
+        parsed_windows = list(
+            dict.fromkeys(int(value.strip()) for value in windows.split(","))
+        )
+        if not parsed_windows or any(window <= 0 for window in parsed_windows):
+            raise ValueError("Windows must be positive integers")
+        return clean_json(
+            _dashboard_service.market_analysis(
+                symbol, parsed_windows, price, refresh
+            )
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+
 
 STATIC_DIR = Path(__file__).parent / "static"
 if STATIC_DIR.exists():
@@ -1713,7 +1155,6 @@ if STATIC_DIR.exists():
 
 
 def run() -> None:
-    """Entry point: `uv run quant-dashboard`. Honors HOST/PORT env vars."""
     import os
 
     import uvicorn

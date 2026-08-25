@@ -12,6 +12,10 @@ const api = {
   quote: (s) => j(`/api/quote/${encodeURIComponent(s)}`),
   history: (s, period = "6mo", interval = "1d") =>
     j(`/api/history/${encodeURIComponent(s)}?period=${period}&interval=${interval}`),
+  analysis: (s, windows, price) =>
+    j(
+      `/api/analysis/${encodeURIComponent(s)}?windows=${encodeURIComponent(windows.join(","))}&price=${encodeURIComponent(price)}`
+    ),
   info: (s) => j(`/api/info/${encodeURIComponent(s)}`),
   analyst: (s) => j(`/api/analyst/${encodeURIComponent(s)}`),
   earnings: (s) => j(`/api/earnings/${encodeURIComponent(s)}`),
@@ -26,8 +30,8 @@ const api = {
   watchlistAdd: (symbol) => j(`/api/watchlist`, "POST", { symbol }),
   watchlistRemove: (symbol) => j(`/api/watchlist/${encodeURIComponent(symbol)}`, "DELETE"),
   holdings: () => j(`/api/holdings`),
-  holdingAdd: (symbol, shares, costBasis) =>
-    j(`/api/holdings`, "POST", { symbol, shares, costBasis }),
+  holdingAdd: (symbol, shares, costBasis, metadata = {}) =>
+    j(`/api/holdings`, "POST", { symbol, shares, costBasis, ...metadata }),
   holdingRemove: (id) => j(`/api/holdings/${encodeURIComponent(id)}`, "DELETE"),
   quotes: (symbols) => j(`/api/quotes?symbols=${encodeURIComponent(symbols.join(","))}`),
   portfolioAnalytics: (period = "1y") =>
@@ -73,18 +77,6 @@ function fmtPct(n) {
 function fmtNum(n, digits = 2) {
   if (n == null || Number.isNaN(n)) return "—";
   return n.toLocaleString("en-US", { maximumFractionDigits: digits });
-}
-
-function sma(points, window) {
-  if (!points || points.length < window) return [];
-  const out = [];
-  let sum = 0;
-  for (let i = 0; i < points.length; i++) {
-    sum += points[i].y;
-    if (i >= window) sum -= points[i - window].y;
-    if (i >= window - 1) out.push({ x: points[i].x, y: sum / window });
-  }
-  return out;
 }
 
 function h(tag, attrs = {}, ...children) {
@@ -488,6 +480,7 @@ async function renderStock(symbol) {
   let chartObj = null;
   let currentPeriod = 3;
   let prevClose = null;
+  const technicalAnalysis = api.analysis(symbol, [50, 200], "close").catch(() => null);
   periods.forEach(([label], i) => {
     const btn = h(
       "button",
@@ -573,8 +566,14 @@ async function renderStock(symbol) {
       const showMA = !isIntraday && !isFiveDay && interval === "1d";
       const maLabels = new Set();
       if (showMA) {
-        const sma50 = sma(data, 50);
-        const sma200 = sma(data, 200);
+        const technical = await technicalAnalysis;
+        const rows = technical?.rows || [];
+        const sma50 = rows
+          .filter((row) => row.movingAverages?.["50"] != null)
+          .map((row) => ({ x: row.date, y: row.movingAverages["50"] }));
+        const sma200 = rows
+          .filter((row) => row.movingAverages?.["200"] != null)
+          .map((row) => ({ x: row.date, y: row.movingAverages["200"] }));
         if (sma50.length) {
           datasets.push({
             label: "50-day MA",
@@ -1282,18 +1281,20 @@ async function renderHoldings() {
     "div",
     {},
     h("h1", {}, "Holdings"),
-    h("div", { class: "muted small" }, "Track cost basis vs. live market value.")
+    h("div", { class: "muted small" }, "Track lots, allocation, and cached market value.")
   );
   const totalsSlot = h("div");
+  const allocationSlot = h("div");
   const analyticsSlot = h("div");
   const chartSlot = h("div");
   const contribSlot = h("div");
   const corrSlot = h("div");
   const form = h("div");
-  const tableSlot = h("div", { class: "panel", style: { padding: 0, overflow: "hidden" } });
+  const tableSlot = h("div", { class: "panel", style: { padding: 0, overflow: "auto" } });
   root.append(
     head,
     totalsSlot,
+    allocationSlot,
     analyticsSlot,
     chartSlot,
     contribSlot,
@@ -1362,6 +1363,17 @@ async function renderHoldings() {
 
     const sharesIn = h("input", { placeholder: "e.g. 10", inputmode: "decimal" });
     const costIn = h("input", { placeholder: "e.g. 150.25", inputmode: "decimal" });
+    const accountIn = h(
+      "select",
+      {},
+      h("option", { value: "" }, "Unspecified"),
+      h("option", { value: "taxable" }, "Taxable"),
+      h("option", { value: "ira" }, "IRA"),
+      h("option", { value: "roth" }, "Roth")
+    );
+    const assetClassIn = h("input", { placeholder: "e.g. equity" });
+    const sectorIn = h("input", { placeholder: "e.g. technology" });
+    const acquiredIn = h("input", { type: "date" });
     const submit = h("button", { type: "submit" }, "Add holding");
     const errMsg = h("div", { class: "small down", style: { display: "none", marginTop: "8px" } });
 
@@ -1383,10 +1395,19 @@ async function renderHoldings() {
 
           submit.disabled = true;
           try {
-            await api.holdingAdd(sym, sh, cb);
+            await api.holdingAdd(sym, sh, cb, {
+              account: accountIn.value || null,
+              assetClass: assetClassIn.value.trim() || null,
+              sector: sectorIn.value.trim() || null,
+              acquired: acquiredIn.value || null,
+            });
             symInput.value = "";
             sharesIn.value = "";
             costIn.value = "";
+            accountIn.value = "";
+            assetClassIn.value = "";
+            sectorIn.value = "";
+            acquiredIn.value = "";
             symResults.style.display = "none";
             await draw();
           } catch (err) {
@@ -1417,6 +1438,30 @@ async function renderHoldings() {
           h("div", { class: "muted small", style: { marginBottom: "4px" } }, "Cost / share"),
           costIn
         ),
+        h(
+          "div",
+          {},
+          h("div", { class: "muted small", style: { marginBottom: "4px" } }, "Account"),
+          accountIn
+        ),
+        h(
+          "div",
+          {},
+          h("div", { class: "muted small", style: { marginBottom: "4px" } }, "Asset class"),
+          assetClassIn
+        ),
+        h(
+          "div",
+          {},
+          h("div", { class: "muted small", style: { marginBottom: "4px" } }, "Sector"),
+          sectorIn
+        ),
+        h(
+          "div",
+          {},
+          h("div", { class: "muted small", style: { marginBottom: "4px" } }, "Acquired"),
+          acquiredIn
+        ),
         submit
       ),
       errMsg
@@ -1445,6 +1490,16 @@ async function renderHoldings() {
         totalCard("Return", fmtPct(t.gainPercent), tUp ? "up" : "down")
       )
     );
+    const allocations = data.allocations || {};
+    allocationSlot.replaceChildren(
+      h(
+        "div",
+        { class: "grid cols-3" },
+        allocationCard("By account", allocations.account || []),
+        allocationCard("By asset class", allocations.assetClass || []),
+        allocationCard("By sector", allocations.sector || [])
+      )
+    );
 
     const tbl = h(
       "table",
@@ -1456,13 +1511,14 @@ async function renderHoldings() {
           "tr",
           {},
           h("th", {}, "Symbol"),
+          h("th", {}, "Account / Class"),
           h("th", {}, "Shares"),
           h("th", {}, "Cost / share"),
           h("th", {}, "Price"),
           h("th", {}, "Market value"),
-          h("th", {}, "Cost value"),
           h("th", {}, "P/L"),
           h("th", {}, "Return"),
+          h("th", {}, "Weight"),
           h("th", {})
         )
       ),
@@ -1476,7 +1532,7 @@ async function renderHoldings() {
           {},
           h(
             "td",
-            { colspan: 9, class: "muted", style: { textAlign: "center", padding: "24px" } },
+            { colspan: 10, class: "muted", style: { textAlign: "center", padding: "24px" } },
             "No holdings yet."
           )
         )
@@ -1489,13 +1545,27 @@ async function renderHoldings() {
             "tr",
             {},
             h("td", {}, h("a", { href: `#/stock/${holding.symbol}` }, holding.symbol)),
+            h(
+              "td",
+              {},
+              h("div", {}, holding.account || "—"),
+              h(
+                "div",
+                { class: "muted small" },
+                [holding.assetClass, holding.sector].filter(Boolean).join(" · ") || ""
+              )
+            ),
             h("td", {}, fmtNum(holding.shares, 4)),
             h("td", {}, fmtMoney(holding.costBasis)),
             h("td", {}, fmtMoney(holding.price ?? null)),
             h("td", {}, fmtMoney(holding.marketValue ?? null)),
-            h("td", { class: "muted" }, fmtMoney(holding.costValue ?? null)),
             h("td", { class: up ? "up" : "down" }, fmtMoney(holding.gain ?? null)),
             h("td", { class: up ? "up" : "down" }, fmtPct(holding.gainPercent ?? null)),
+            h(
+              "td",
+              {},
+              holding.weightPercent == null ? "—" : `${fmtNum(holding.weightPercent)}%`
+            ),
             h(
               "td",
               { class: "right" },
@@ -1542,6 +1612,35 @@ async function renderHoldings() {
       contribSlot.replaceChildren();
       corrSlot.replaceChildren();
     }
+  }
+
+  function allocationCard(title, rows) {
+    return h(
+      "div",
+      { class: "panel" },
+      h("h2", {}, title),
+      rows.length
+        ? rows.map((row) =>
+            h(
+              "div",
+              { class: "allocation-row" },
+              h(
+                "div",
+                { class: "row between small" },
+                h("span", {}, row.name),
+                h("span", { class: "muted" }, `${fmtNum(row.weightPercent)}%`)
+              ),
+              h(
+                "div",
+                { class: "allocation-track" },
+                h("span", {
+                  style: { width: `${Math.max(0, Math.min(100, row.weightPercent || 0))}%` },
+                })
+              )
+            )
+          )
+        : h("div", { class: "muted small" }, "No classified positions")
+    );
   }
 
   await draw();
